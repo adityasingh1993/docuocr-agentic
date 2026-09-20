@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -29,6 +30,7 @@ class CheckboxOption(BlueprintModel):
 
 class CheckboxGroup(BlueprintModel):
     exclusive: bool = False
+    aliases: list[str] = Field(default_factory=list)
     options: dict[str, CheckboxOption] = Field(min_length=1)
 
 
@@ -78,6 +80,41 @@ class DocumentBlueprint(BlueprintModel):
         return {
             path for path, spec in self.fields.items() if spec.critical or spec.required
         }
+
+    @property
+    def checkbox_paths(self) -> set[str]:
+        return {
+            option.output_path
+            for group in self.checkbox_groups.values()
+            for option in group.options.values()
+        }
+
+    def vlm_hints(self, paths: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Describe field semantics without changing raw OCR/value text."""
+
+        requested = set(paths)
+        hints: dict[str, dict[str, Any]] = {}
+        for path, spec in self.fields.items():
+            if path not in requested:
+                continue
+            hints[path] = {
+                "kind": "printed_label_value",
+                "valueType": spec.type,
+                "printedLabelAliases": spec.aliases,
+            }
+        for group_name, group in self.checkbox_groups.items():
+            for option_name, option in group.options.items():
+                if option.output_path not in requested:
+                    continue
+                hints[option.output_path] = {
+                    "kind": "control_option",
+                    "group": group_name,
+                    "groupLabelAliases": group.aliases,
+                    "exclusive": group.exclusive,
+                    "option": option_name,
+                    "printedLabelAliases": option.aliases,
+                }
+        return hints
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> DocumentBlueprint:

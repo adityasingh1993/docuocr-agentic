@@ -8,77 +8,82 @@ anchors:
   - newborn screening
   - baby details
   - sample collection
+  - triagem neonatal
+  - dados do bebê
+  - dados do bebe
+  - coleta da amostra
 
 fields:
   data.baby.birthTime:
     type: time
-    aliases: [birth time, time of birth, born at]
+    aliases: [birth time, time of birth, born at, hora de nascimento, horário de nascimento, horario de nascimento]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.baby.birthWeight:
     type: weight
-    aliases: [birth weight, weight at birth]
+    aliases: [birth weight, weight at birth, peso ao nascer, peso de nascimento, peso]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.baby.dateOfBirth:
     type: date
-    aliases: [date of birth, dob, birth date]
+    aliases: [date of birth, dob, birth date, data de nascimento, dt de nascimento, nascimento]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
     critical: true
   data.baby.firstName:
     type: string
-    aliases: [baby first name, child first name, given name, first name]
+    aliases: [baby first name, child first name, given name, first name, primeiro nome do bebê, primeiro nome do bebe, nome próprio, nome proprio]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
     critical: true
   data.baby.lastName:
     type: string
-    aliases: [baby last name, child last name, family name, surname, last name]
+    aliases: [baby last name, child last name, family name, surname, last name, sobrenome do bebê, sobrenome do bebe, sobrenome]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
     critical: true
   data.baby.nationality:
     type: string
-    aliases: [nationality, citizenship]
+    aliases: [nationality, citizenship, nacionalidade, cidadania]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.baby.medication:
     type: string
-    aliases: [medication, medicines, current medication]
+    aliases: [medication, medicines, current medication, medicação, medicacao, medicamentos]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.baby.parenteral:
     type: string
-    aliases: [parenteral]
+    aliases: [parenteral, nutrição parenteral, nutricao parenteral]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.baby.registerNumber:
     type: string
-    aliases: [register number, registration number, registration no, reg no]
+    aliases: [register number, registration number, registration no, reg no, número de registro, numero de registro, registro, prontuário, prontuario]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
     critical: true
   data.baby.sample.collection.date:
     type: date
-    aliases: [collection date, sample collection date, date collected]
+    aliases: [collection date, sample collection date, date collected, data de coleta, data da coleta]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
     critical: true
   data.baby.sample.collection.time:
     type: time
-    aliases: [collection time, sample collection time, time collected]
+    aliases: [collection time, sample collection time, time collected, hora da coleta, hora de coleta, horário da coleta, horario da coleta]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.payer.healthInsurance:
     type: string
-    aliases: [health insurance, insurer, insurance]
+    aliases: [health insurance, insurer, insurance, convênio, convenio, plano de saúde, plano de saude]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
   data.serialNumber:
     type: string
-    aliases: [serial number, serial no, card number, form number]
+    aliases: [serial number, serial no, card number, form number, número de série, numero de serie, número do cartão, numero do cartao]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
     critical: true
 
 checkbox_groups:
   baby_sex:
     exclusive: true
+    aliases: [sex, sexo, gender, gênero, genero]
     options:
       male:
         output_path: data.baby.male
-        aliases: [male, m]
+        aliases: [male, m, masculino]
       female:
         output_path: data.baby.female
-        aliases: [female, f]
+        aliases: [female, f, feminino]
   consent_all_and_ngs:
     exclusive: false
     options:

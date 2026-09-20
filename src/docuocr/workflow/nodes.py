@@ -225,33 +225,46 @@ class WorkflowNodes:
                     "candidates": [item.model_dump(mode="json") for item in candidates],
                     "_decision": "disabled",
                 }
-            present = {
-                item.path for item in candidates if item.normalized_value is not None
-            }
-            target_paths = [
-                path for path in self.blueprint.output_paths if path not in present
-            ]
+            checkbox_paths = self.blueprint.checkbox_paths
+            target_paths = _vlm_target_paths(self.blueprint, candidates)
             if not target_paths:
                 return {
                     "candidates": [item.model_dump(mode="json") for item in candidates],
                     "_stage_confidence": 1.0,
                     "_decision": "no_unresolved_mapping",
                 }
+            quality = QualityReport.model_validate(state["quality"])
+            active_image = Path(state["active_image_path"])
+            image_evidence = EvidenceRecord(
+                id="image:vlm:p1:active",
+                kind=EvidenceKind.IMAGE,
+                bbox=BBox(x1=0, y1=0, x2=quality.width, y2=quality.height),
+                confidence=quality.overall,
+                source="document_image",
+                artifact_path=str(active_image),
+                artifact_sha256=sha256_file(active_image),
+                transform_chain=["active_document"],
+            )
+            evidence = _models(EvidenceRecord, state.get("evidence", []))
+            evidence.append(image_evidence)
             additions, warnings = self._vlm_candidates(
-                image_path=state["active_image_path"],
+                image_path=active_image,
                 target_paths=target_paths,
                 spans=_models(OCRSpan, state.get("ocr_spans", [])),
                 blocks=_models(LayoutBlock, state.get("layout_blocks", [])),
                 controls=_models(FormControl, state.get("controls", [])),
-                evidence=_models(EvidenceRecord, state.get("evidence", [])),
+                evidence=evidence,
                 attempt=0,
-                visual_verification=False,
+                visual_verification=True,
+                image_evidence_id=image_evidence.id,
+            )
+            merged, reconciliation_warnings = _reconcile_visual_controls(
+                candidates + additions, checkbox_paths
             )
             return {
-                "candidates": [
-                    item.model_dump(mode="json") for item in candidates + additions
-                ],
-                "warnings": warnings,
+                "candidates": [item.model_dump(mode="json") for item in merged],
+                "evidence": [image_evidence.model_dump(mode="json")],
+                "warnings": warnings + reconciliation_warnings,
                 "_stage_confidence": len({item.path for item in additions})
                 / max(1, len(target_paths)),
             }
@@ -330,6 +343,9 @@ class WorkflowNodes:
                 recovered = self._recover_page(state, plans, attempt)
             else:
                 recovered = self._recover_crops(state, plans, attempt)
+            merged, reconciliation_warnings = _reconcile_visual_controls(
+                existing + recovered["candidates"], self.blueprint.checkbox_paths
+            )
             return {
                 "field_attempt": attempt,
                 "active_image_path": recovered["active_image_path"],
@@ -339,11 +355,8 @@ class WorkflowNodes:
                 "evidence": recovered["evidence"],
                 "ocr_ledger": recovered["ocr_ledger"],
                 "control_ledger": recovered["control_ledger"],
-                "candidates": [
-                    item.model_dump(mode="json")
-                    for item in existing + recovered["candidates"]
-                ],
-                "warnings": recovered["warnings"],
+                "candidates": [item.model_dump(mode="json") for item in merged],
+                "warnings": recovered["warnings"] + reconciliation_warnings,
                 "_decision": "rescore",
             }
 
@@ -651,17 +664,18 @@ class WorkflowNodes:
     ) -> tuple[list[FieldCandidate], list[str]]:
         if self.vlm is None:
             return [], []
-        proposals = self.vlm.propose(
+        result = self.vlm.propose(
             image_path=image_path,
             target_paths=target_paths,
             spans=spans,
             blocks=blocks,
             controls=controls,
             image_evidence_id=image_evidence_id,
+            field_hints=self.blueprint.vlm_hints(target_paths),
         )
         candidates: list[FieldCandidate] = []
-        warnings: list[str] = []
-        for proposal in proposals:
+        warnings = list(result.warnings)
+        for proposal in result.proposals:
             try:
                 candidates.append(
                     self.grounding.verify(
@@ -787,6 +801,71 @@ class WorkflowNodes:
                 json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         return update
+
+
+def _reconcile_visual_controls(
+    candidates: list[FieldCandidate], checkbox_paths: set[str]
+) -> tuple[list[FieldCandidate], list[str]]:
+    """Prefer a uniquely grounded visual reading over conflicting contour guesses."""
+
+    visual_by_path: dict[str, list[FieldCandidate]] = {}
+    for candidate in candidates:
+        sources = {item.casefold() for item in candidate.support_sources}
+        if (
+            candidate.path in checkbox_paths
+            and candidate.source == "vlm_visual"
+            and "local_vlm_visual" in sources
+            and len(sources) >= 2
+            and candidate.normalized_value is not None
+        ):
+            visual_by_path.setdefault(candidate.path, []).append(candidate)
+
+    authoritative: dict[str, str] = {}
+    for path, items in visual_by_path.items():
+        fingerprints = {item.value_fingerprint() for item in items}
+        if len(fingerprints) == 1:
+            authoritative[path] = next(iter(fingerprints))
+
+    filtered: list[FieldCandidate] = []
+    removed: dict[str, int] = {}
+    for candidate in candidates:
+        expected = authoritative.get(candidate.path)
+        if (
+            expected is not None
+            and candidate.source == "opencv_control"
+            and candidate.normalized_value is not None
+            and candidate.value_fingerprint() != expected
+        ):
+            removed[candidate.path] = removed.get(candidate.path, 0) + 1
+            continue
+        filtered.append(candidate)
+    warnings = [
+        f"visual_control_overrode_opencv:{path}:{count}"
+        for path, count in sorted(removed.items())
+    ]
+    return filtered, warnings
+
+
+def _vlm_target_paths(
+    blueprint: DocumentBlueprint, candidates: list[FieldCandidate]
+) -> list[str]:
+    present = {item.path for item in candidates if item.normalized_value is not None}
+    sources_by_path: dict[str, set[str]] = {}
+    for candidate in candidates:
+        if candidate.normalized_value is None:
+            continue
+        sources_by_path.setdefault(candidate.path, set()).update(
+            source.casefold() for source in candidate.support_sources if source
+        )
+    return [
+        path
+        for path in blueprint.output_paths
+        if (
+            path not in present
+            or path in blueprint.checkbox_paths
+            or len(sources_by_path.get(path, set())) < 2
+        )
+    ]
 
 
 def _ocr_evidence(item: OCRSpan) -> EvidenceRecord:

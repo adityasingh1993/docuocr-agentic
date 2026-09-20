@@ -3,4 +3,4 @@
 from .contract import ExtractionEnvelope
 
 __all__ = ["ExtractionEnvelope"]
-__version__ = "0.1.0"
+__version__ = "0.1.2"

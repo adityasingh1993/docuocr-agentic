@@ -31,7 +31,10 @@ vlm:
   model: Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M
   api_key: local-only
   timeout_seconds: 120
-  max_tokens: 1200
+  max_tokens: 2048
+  max_paths_per_request: 4
+  max_controls_per_request: 32
+  request_retries: 1
   allow_private_lan: false
 
 trace:

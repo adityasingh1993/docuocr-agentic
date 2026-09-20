@@ -99,6 +99,7 @@ class EvidenceKind(StrEnum):
     LAYOUT = "layout"
     CONTROL = "control"
     CROP = "crop"
+    IMAGE = "image"
 
 
 class EvidenceRecord(StrictModel):

@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 InferenceEngine = Literal[
     "paddle", "paddle_static", "paddle_dynamic", "transformers", "onnxruntime"
 ]
@@ -55,9 +54,7 @@ class PaddleSettings(SettingsModel):
     @model_validator(mode="after")
     def require_enabled_component(self) -> PaddleSettings:
         if self.enabled and not (self.text_enabled or self.layout_enabled):
-            raise ValueError(
-                "paddle.enabled requires text_enabled or layout_enabled"
-            )
+            raise ValueError("paddle.enabled requires text_enabled or layout_enabled")
         return self
 
 
@@ -67,7 +64,10 @@ class VLMSettings(SettingsModel):
     model: str = "Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M"
     api_key: str = "local-only"
     timeout_seconds: float = Field(default=120.0, gt=0.0, le=900.0)
-    max_tokens: int = Field(default=1200, ge=128, le=8192)
+    max_tokens: int = Field(default=2048, ge=128, le=8192)
+    max_paths_per_request: int = Field(default=4, ge=1, le=32)
+    max_controls_per_request: int = Field(default=32, ge=0, le=256)
+    request_retries: int = Field(default=1, ge=0, le=3)
     allow_private_lan: bool = False
 
     @model_validator(mode="after")
@@ -115,9 +115,7 @@ class AppSettings(SettingsModel):
         if self.paddle.text_enabled:
             required.update(
                 {
-                    "text_detection_model_dir": (
-                        self.paddle.text_detection_model_dir
-                    ),
+                    "text_detection_model_dir": (self.paddle.text_detection_model_dir),
                     "text_recognition_model_dir": (
                         self.paddle.text_recognition_model_dir
                     ),

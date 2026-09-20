@@ -49,7 +49,7 @@ def normalize_value(
 
 
 def _normalize_date(text: str, order: str) -> NormalizationResult:
-    normalized = text.replace(".", "/").replace("-", "/")
+    normalized = text.replace(".", "/").replace("-", "/").replace(",", "/")
     iso_match = re.fullmatch(r"(\d{4})/(\d{1,2})/(\d{1,2})", normalized)
     if iso_match:
         parts = tuple(int(item) for item in iso_match.groups())
@@ -57,6 +57,23 @@ def _normalize_date(text: str, order: str) -> NormalizationResult:
 
     match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", normalized)
     if not match:
+        compact = re.sub(r"\D", "", text)
+        if len(compact) in {6, 8}:
+            if order == "YMD" and len(compact) == 8:
+                year, first, second = (
+                    int(compact[:4]),
+                    int(compact[4:6]),
+                    int(compact[6:8]),
+                )
+                return _validated_date(year, first, second)
+            first, second = int(compact[:2]), int(compact[2:4])
+            year = int(compact[4:])
+            year = year + 2000 if len(compact) == 6 else year
+            if order == "REJECT_AMBIGUOUS" and first <= 12 and second <= 12:
+                return NormalizationResult(value=None, codes=["ambiguous_date"])
+            if order == "MDY":
+                return _validated_date(year, first, second)
+            return _validated_date(year, second, first)
         for pattern in ("%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y"):
             try:
                 parsed = datetime.strptime(text, pattern).replace(tzinfo=UTC)

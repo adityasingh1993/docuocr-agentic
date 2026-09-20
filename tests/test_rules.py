@@ -5,7 +5,15 @@ from pathlib import Path
 
 from docuocr.extraction.blueprint import DocumentBlueprint
 from docuocr.extraction.rules import map_rule_candidates
-from docuocr.models import BBox, ControlKind, ControlState, FormControl, OCRSpan
+from docuocr.models import (
+    BBox,
+    ControlKind,
+    ControlState,
+    FieldCandidate,
+    FormControl,
+    OCRSpan,
+)
+from docuocr.workflow.nodes import _reconcile_visual_controls, _vlm_target_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,6 +59,80 @@ class RuleMappingTests(unittest.TestCase):
         self.assertEqual(by_path["data.baby.firstName"].normalized_value, "Amina")
         self.assertIs(by_path["data.baby.female"].normalized_value, True)
         self.assertEqual(by_path["data.baby.female"].support_sources, ["opencv"])
+
+    def test_portuguese_printed_label_maps_without_changing_entered_value(self) -> None:
+        spans = [
+            OCRSpan(
+                id="ocr:p1:label",
+                text="PESO",
+                confidence=0.99,
+                bbox=BBox(x1=10, y1=10, x2=80, y2=35),
+            ),
+            OCRSpan(
+                id="ocr:p1:value",
+                text="3735",
+                confidence=0.98,
+                bbox=BBox(x1=100, y1=10, x2=170, y2=35),
+            ),
+        ]
+        candidates = map_rule_candidates(self.blueprint, spans, [])
+        weight = next(
+            item for item in candidates if item.path == "data.baby.birthWeight"
+        )
+        self.assertEqual(weight.raw_value, "3735")
+        self.assertEqual(weight.normalized_value, "3.735 kg")
+
+    def test_grounded_visual_control_overrides_conflicting_contour_guess(self) -> None:
+        opencv = FieldCandidate(
+            path="data.baby.male",
+            raw_value=True,
+            normalized_value=True,
+            evidence_ids=["control:wrong"],
+            source="opencv_control",
+            support_sources=["opencv"],
+            recognition_confidence=0.95,
+            association_confidence=0.95,
+        )
+        visual = FieldCandidate(
+            path="data.baby.male",
+            raw_value=False,
+            normalized_value=False,
+            evidence_ids=["ocr:sex", "image:page"],
+            source="vlm_visual",
+            support_sources=["paddleocr", "local_vlm_visual"],
+            recognition_confidence=0.98,
+            association_confidence=0.92,
+        )
+        reconciled, warnings = _reconcile_visual_controls(
+            [opencv, visual], self.blueprint.checkbox_paths
+        )
+        self.assertEqual(reconciled, [visual])
+        self.assertEqual(warnings, ["visual_control_overrode_opencv:data.baby.male:1"])
+
+    def test_vlm_rechecks_single_source_and_control_candidates(self) -> None:
+        single_source = FieldCandidate(
+            path="data.baby.birthWeight",
+            raw_value="3735",
+            normalized_value="3.735 kg",
+            evidence_ids=["ocr:weight"],
+            source="rule_right_of_label",
+            support_sources=["paddleocr"],
+        )
+        independently_supported = FieldCandidate(
+            path="data.baby.dateOfBirth",
+            raw_value="06/08/2024",
+            normalized_value="2024-08-06",
+            evidence_ids=["ocr:dob", "layout:dob"],
+            source="rule_right_of_label",
+            support_sources=["paddleocr", "paddleocr-vl"],
+        )
+        paths = _vlm_target_paths(
+            self.blueprint, [single_source, independently_supported]
+        )
+        self.assertIn("data.baby.birthWeight", paths)
+        self.assertNotIn("data.baby.dateOfBirth", paths)
+        self.assertIn("data.baby.male", paths)
+        self.assertIn("data.baby.female", paths)
 
 
 if __name__ == "__main__":

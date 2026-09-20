@@ -63,6 +63,44 @@ class GroundingTests(unittest.TestCase):
                 attempt=0,
             )
 
+    def test_visual_boolean_can_use_actual_image_and_printed_group_label(self) -> None:
+        label = OCRSpan(
+            id="ocr:p1:sex",
+            text="SEXO",
+            confidence=0.99,
+            bbox=BBox(x1=10, y1=10, x2=80, y2=35),
+        )
+        label_evidence = EvidenceRecord(
+            id=label.id,
+            kind=EvidenceKind.OCR,
+            bbox=label.bbox,
+            confidence=0.99,
+            source="paddleocr",
+        )
+        image_evidence = EvidenceRecord(
+            id="image:vlm:p1:active",
+            kind=EvidenceKind.IMAGE,
+            bbox=BBox(x1=0, y1=0, x2=200, y2=100),
+            confidence=0.98,
+            source="document_image",
+        )
+        result = GroundingVerifier().verify(
+            GroundedProposal(
+                path="data.baby.female",
+                rawValue=True,
+                evidenceIds=[label.id, image_evidence.id],
+            ),
+            self.blueprint,
+            [label_evidence, image_evidence],
+            [label],
+            [],
+            [],
+            attempt=0,
+            visual_verification=True,
+        )
+        self.assertIs(result.normalized_value, True)
+        self.assertEqual(result.support_sources, ["paddleocr", "local_vlm_visual"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,21 +67,41 @@ class GroundingVerifier:
             field_spec = FieldSpec(
                 type="boolean", aliases=[proposal.path.rsplit(".", 1)[-1]]
             )
+        cited_records = [records[item] for item in proposal.evidence_ids]
+        has_visual_evidence = visual_verification and any(
+            record.kind in {EvidenceKind.CROP, EvidenceKind.IMAGE}
+            for record in cited_records
+        )
         if field_spec.type == "boolean":
             cited_controls = [
                 controls_by_id[item]
                 for item in proposal.evidence_ids
                 if item in controls_by_id
             ]
-            if not cited_controls or proposal.raw_value is None:
-                raise GroundingError("boolean_requires_control_evidence")
-            expected = any(
-                item.state == ControlState.CHECKED for item in cited_controls
-            )
-            if any(item.state == ControlState.AMBIGUOUS for item in cited_controls):
-                raise GroundingError("ambiguous_control_evidence")
-            if bool(proposal.raw_value) != expected:
-                raise GroundingError("boolean_conflicts_with_control")
+            if proposal.raw_value is None:
+                raise GroundingError("boolean_requires_value")
+            if not has_visual_evidence:
+                if not cited_controls:
+                    raise GroundingError("boolean_requires_control_evidence")
+                if any(item.state == ControlState.AMBIGUOUS for item in cited_controls):
+                    raise GroundingError("ambiguous_control_evidence")
+                expected = any(
+                    item.state == ControlState.CHECKED for item in cited_controls
+                )
+                if bool(proposal.raw_value) != expected:
+                    raise GroundingError("boolean_conflicts_with_control")
+            else:
+                unambiguous = [
+                    item
+                    for item in cited_controls
+                    if item.state != ControlState.AMBIGUOUS
+                ]
+                if unambiguous:
+                    expected = any(
+                        item.state == ControlState.CHECKED for item in unambiguous
+                    )
+                    if bool(proposal.raw_value) != expected:
+                        raise GroundingError("boolean_conflicts_with_cited_control")
         elif proposal.raw_value is None or not _text_supports_value(
             str(proposal.raw_value), cited_text
         ):
@@ -90,11 +110,14 @@ class GroundingVerifier:
         normalized = normalize_value(
             proposal.raw_value, field_spec, blueprint.normalization
         )
-        cited_records = [records[item] for item in proposal.evidence_ids]
-        support_sources = list(dict.fromkeys(record.source for record in cited_records))
-        if visual_verification and any(
-            record.kind == EvidenceKind.CROP for record in cited_records
-        ):
+        support_sources = list(
+            dict.fromkeys(
+                record.source
+                for record in cited_records
+                if record.kind not in {EvidenceKind.CROP, EvidenceKind.IMAGE}
+            )
+        )
+        if has_visual_evidence:
             support_sources.append("local_vlm_visual")
         recognition = min((record.confidence for record in cited_records), default=0.0)
         return FieldCandidate(

@@ -73,7 +73,8 @@ The gateway rejects a proposal when:
 - its field path is not in the blueprint;
 - any evidence ID is unknown;
 - a string value is not supported by cited OCR text;
-- a boolean is not supported by a cited control state;
+- a boolean is not supported by either a cited control state or visual evidence
+  from the actual image plus a cited printed option/group label;
 - normalization cannot be reproduced by deterministic code.
 
 The VLM's own confidence is ignored.
@@ -110,6 +111,12 @@ Forms are handled with versioned blueprints rather than code branches. A bluepri
 - normalization and validation rules;
 - required/critical flags;
 - template-specific ROIs when available.
+
+Printed label aliases may be multilingual. Translation/canonicalization applies
+only to label semantics; entered and handwritten values remain literal. Visual
+control groups are re-checked even when OpenCV already emitted a candidate,
+because recognizing an option label such as `M` or `F` does not establish which
+option was circled or checked.
 
 Resolution order:
 
@@ -184,4 +191,3 @@ Before production auto-acceptance, evaluate by form family, script, printed/hand
 - latency, peak RAM/VRAM, and retry distribution.
 
 The launch criterion should be a bounded false auto-accept rate on critical fields, not a single average accuracy.
-

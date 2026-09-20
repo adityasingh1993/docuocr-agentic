@@ -14,7 +14,7 @@ The repository is deliberately **bounded-agentic**. LangGraph can retry approved
    - run exhaustive box-level PaddleOCR;
    - detect checkbox/radio controls with OpenCV.
 5. Resolve a form blueprint and generate geometry-based field candidates.
-6. Ask a local VLM only for unresolved mappings. The VLM must cite existing OCR/control evidence IDs.
+6. Ask a local VLM for unresolved mappings and visual re-checking of every checkbox/radio group. The VLM must cite existing OCR plus actual-image evidence IDs.
 7. Normalize and validate values with Pydantic and cross-field rules.
 8. Score every field. Values below `0.90` receive targeted crop enhancement and independent re-verification.
 9. Accept a value only when it is grounded, valid, and above policy. Otherwise pause/queue it for review.
@@ -35,6 +35,11 @@ PaddleOCR-VL remains useful for page structure, but its Markdown is not treated 
 ## Local VLM profiles
 
 The application speaks to an OpenAI-compatible endpoint through `LocalVLMClient`. External hosts are rejected by default.
+
+VLM requests are split into small field batches. If a local server returns a
+truncated or malformed JSON batch, DocuOCR splits the batch and retries smaller
+requests. A malformed single-field response is recorded as a warning instead of
+raising `JSONDecodeError` and terminating the document job.
 
 ### Portable Mac or NVIDIA profile: llama.cpp
 
@@ -65,6 +70,25 @@ mlx_vlm.server \
 For this profile, change `vlm.model` in `config/settings.yaml` to
 `mlx-community/Qwen3-VL-4B-Instruct-4bit`. Keep the configured model ID aligned
 with the server's loaded model.
+
+When Windows calls an MLX-VLM server running on another private-network machine,
+enable the private endpoint explicitly:
+
+```yaml
+vlm:
+  enabled: true
+  base_url: http://<mac-ip>:8082/v1
+  model: mlx-community/Qwen3-VL-4B-Instruct-4bit
+  api_key: local-only
+  max_tokens: 2048
+  max_paths_per_request: 4
+  max_controls_per_request: 32
+  request_retries: 1
+  allow_private_lan: true
+```
+
+`api_key` is an arbitrary shared placeholder unless the local server has been
+configured to validate a real bearer token.
 
 For PaddleOCR-VL itself, Apple Silicon can use its PaddlePaddle layout stage and an MLX-VLM recognition service. Blackwell GPUs require the Blackwell-specific Paddle/CUDA build described in the official PaddleOCR guide.
 
@@ -159,6 +183,13 @@ deployed separately. Enable `layout_enabled` only after `layout_model_dir` and
 `vl_rec_model_dir` have been supplied in the selected layout engine's format.
 
 The example newborn-screening blueprint is in `config/blueprints/newborn_screening.yaml`. Add another YAML blueprint for each form family or country variant; do not fork the extraction code.
+
+Blueprint aliases may contain multiple languages. Deterministic rules and the
+VLM use translated/canonical printed labels only to locate a field. Entered or
+handwritten names, identifiers, dates, and free text are never translated; their
+raw OCR text remains the evidence. For a control such as `M`/`F`, the characters
+are option labels. Selection comes from visible ink—circle, tick, cross, or fill—
+in the actual image, not from OCR merely recognizing the option text.
 
 ## Run
 

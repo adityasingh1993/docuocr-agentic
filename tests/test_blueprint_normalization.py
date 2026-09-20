@@ -39,6 +39,20 @@ class BlueprintAndNormalizationTests(unittest.TestCase):
         self.assertIsNone(result.value)
         self.assertIn("ambiguous_date", result.codes)
 
+    def test_common_ocr_date_separators_and_missing_separator_are_normalized(
+        self,
+    ) -> None:
+        spec = FieldSpec(type="date", aliases=["data de nascimento"])
+        settings = NormalizationSettings(date_order="DMY")
+        self.assertEqual(
+            normalize_value("06,08,24", spec, settings).value,
+            "2024-08-06",
+        )
+        self.assertEqual(
+            normalize_value("03.082026", spec, settings).value,
+            "2026-08-03",
+        )
+
     def test_weight_is_normalized_to_kg(self) -> None:
         result = normalize_value(
             "3250 g",
