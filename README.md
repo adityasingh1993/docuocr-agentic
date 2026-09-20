@@ -94,23 +94,76 @@ Install the core project:
 python -m pip install -e ".[test]"
 ```
 
-Install PaddleOCR in its compatible environment:
+For real-image OCR with Paddle-format models, install the PaddlePaddle backend:
 
 ```bash
 python -m pip install -e ".[paddle]"
 ```
 
-PaddlePaddle itself is intentionally not pinned here because its package/index depends on macOS, CUDA, and Blackwell architecture. The alternative Transformers/ONNX model directories can be configured in `config/settings.yaml`.
+Install a different backend only when the local model directories use that format:
+
+```bash
+# Hugging Face / safetensors models
+python -m pip install -e ".[paddle-transformers]"
+
+# ONNX models
+python -m pip install -e ".[paddle-onnx]"
+```
+
+PaddleOCR recommends one inference backend per environment. The selected backend and
+model files must match: Paddle inference models use `engine: paddle`, while Hugging
+Face/safetensors models use `engine: transformers`.
+
+### Apple Silicon
+
+Use a native ARM64 Python environment on M-series Macs. A virtual environment created
+from an Intel Homebrew Python under `/usr/local` remains `x86_64` and can force Rust
+packages such as `cryptography` to build from source.
+
+```bash
+arch -arm64 /opt/homebrew/opt/python@3.12/bin/python3.12 -m venv .venv-arm64
+source .venv-arm64/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -c "import platform; print(platform.machine())"  # must print arm64
+python -m pip install --only-binary=:all: cryptography
+python -m pip install -e ".[paddle]"
+```
+
+The Python.org universal2 build is also usable by invoking it with `arch -arm64`.
+If `--only-binary` cannot find `cryptography`, the configured package mirror must add
+the macOS ARM64 wheel; do not silently fall back to an Intel source build.
 
 ## Configure local model paths
 
 Copy and edit `config/settings.yaml`. In a private or offline deployment, every Paddle model directory must be explicit and already present locally. `offline: true` prevents an accidental model-host lookup.
 
+Start with real-image text OCR only. This does not use a sidecar and avoids loading the
+larger layout/VL pipeline until its matching model files have been verified:
+
+```yaml
+paddle:
+  enabled: true
+  text_enabled: true
+  layout_enabled: false
+  engine: paddle
+  device: cpu
+  text_detection_model_dir: /absolute/path/to/PP-OCRv6_medium_det
+  text_recognition_model_dir: /absolute/path/to/PP-OCRv6_medium_rec
+
+vlm:
+  enabled: false
+```
+
+`text_engine` and `layout_engine` may override `engine` when the two stages are
+deployed separately. Enable `layout_enabled` only after `layout_model_dir` and
+`vl_rec_model_dir` have been supplied in the selected layout engine's format.
+
 The example newborn-screening blueprint is in `config/blueprints/newborn_screening.yaml`. Add another YAML blueprint for each form family or country variant; do not fork the extraction code.
 
 ## Run
 
-With installed local backends:
+With installed local backends, pass the actual image as the positional argument and
+do not include `--sidecar`:
 
 ```bash
 docuocr extract path/to/card.jpg \

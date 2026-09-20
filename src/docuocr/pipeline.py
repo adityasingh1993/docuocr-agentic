@@ -33,12 +33,12 @@ class DocumentPipeline:
         else:
             text_engine = (
                 PaddleTextEngine(settings.paddle)
-                if settings.paddle.enabled
+                if settings.paddle.enabled and settings.paddle.text_enabled
                 else NullTextEngine()
             )
             layout_engine = (
                 PaddleLayoutEngine(settings.paddle)
-                if settings.paddle.enabled
+                if settings.paddle.enabled and settings.paddle.layout_enabled
                 else NullLayoutEngine()
             )
             control_engine = OpenCVControlEngine()

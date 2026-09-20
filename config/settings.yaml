@@ -11,8 +11,10 @@ policy:
 
 paddle:
   enabled: false
-  engine: transformers
-  device: gpu:0
+  text_enabled: true
+  layout_enabled: false
+  engine: paddle
+  device: cpu
   language: en
   layout_model_dir: C:/paddle_models/PP-DocLayoutV3_safetensors
   vl_rec_model_dir: C:/paddle_models/PaddleOCR-VL-1.6
@@ -35,4 +37,3 @@ vlm:
 trace:
   include_values: false
   save_crops: true
-

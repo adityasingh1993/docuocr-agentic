@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from docuocr.config import AppSettings, VLMSettings
+from docuocr.config import AppSettings, PaddleSettings, VLMSettings
 from docuocr.trace import TraceWriter
 
 
@@ -21,6 +21,38 @@ class ConfigAndTraceTests(unittest.TestCase):
     def test_offline_paddle_requires_local_model_directories(self) -> None:
         with self.assertRaisesRegex(ValueError, "explicit paths"):
             AppSettings.model_validate({"offline": True, "paddle": {"enabled": True}})
+
+    def test_text_only_offline_paddle_does_not_require_layout_models(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            detection = root / "detection"
+            recognition = root / "recognition"
+            detection.mkdir()
+            recognition.mkdir()
+            settings = AppSettings.model_validate(
+                {
+                    "offline": True,
+                    "paddle": {
+                        "enabled": True,
+                        "text_enabled": True,
+                        "layout_enabled": False,
+                        "text_detection_model_dir": str(detection),
+                        "text_recognition_model_dir": str(recognition),
+                    },
+                }
+            )
+            self.assertFalse(settings.paddle.layout_enabled)
+
+    def test_component_engines_can_be_selected_independently(self) -> None:
+        settings = PaddleSettings(
+            engine="paddle", text_engine="paddle_static", layout_engine="transformers"
+        )
+        self.assertEqual(settings.resolved_text_engine, "paddle_static")
+        self.assertEqual(settings.resolved_layout_engine, "transformers")
+
+    def test_enabled_paddle_requires_at_least_one_component(self) -> None:
+        with self.assertRaisesRegex(ValueError, "text_enabled or layout_enabled"):
+            PaddleSettings(enabled=True, text_enabled=False, layout_enabled=False)
 
     def test_trace_append_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,10 +1,62 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any
 
 from docuocr.config import PaddleSettings
 from docuocr.models import BBox, LayoutBlock, OCRSpan
+
+
+_ENGINE_INSTALL_HINTS = {
+    "transformers": 'Install the Transformers backend with `python -m pip install -e ".[paddle-transformers]"`.',
+    "onnxruntime": 'Install the ONNX Runtime backend with `python -m pip install -e ".[paddle-onnx]"`.',
+    "paddle": 'Install the PaddlePaddle backend with `python -m pip install -e ".[paddle]"`.',
+    "paddle_static": 'Install the PaddlePaddle backend with `python -m pip install -e ".[paddle]"`.',
+    "paddle_dynamic": 'Install the PaddlePaddle backend with `python -m pip install -e ".[paddle]"`.',
+}
+
+
+def _load_paddle_symbol(name: str, engine: str) -> Any:
+    try:
+        module = importlib.import_module("paddleocr")
+        return getattr(module, name)
+    except Exception as exc:  # pragma: no cover - depends on deployment binaries
+        hint = _ENGINE_INSTALL_HINTS[engine]
+        detail = f"{type(exc).__name__}: {exc}"
+        raise RuntimeError(
+            f"Unable to load paddleocr.{name} for engine {engine!r}. "
+            f"Original error: {detail}. {hint} Use a clean environment containing "
+            "only one inference backend; on Apple Silicon, verify that "
+            "`platform.machine()` returns `arm64`."
+        ) from exc
+
+
+def _raise_model_format_error(
+    exc: ValueError,
+    *,
+    component: str,
+    engine: str,
+    model_directories: list[str | None],
+) -> None:
+    if "No valid model files were found" not in str(exc):
+        return
+    configured = ", ".join(path for path in model_directories if path) or "automatic"
+    raise RuntimeError(
+        f"{component} model files are incompatible with engine {engine!r}. "
+        f"Configured model directories: {configured}. Use a Paddle inference model "
+        "with engine 'paddle', a Hugging Face/safetensors model with engine "
+        "'transformers', or omit local directories in online mode to let PaddleOCR "
+        "resolve compatible models."
+    ) from exc
+
+
+def _raise_if_legacy_engine_argument(exc: TypeError) -> None:
+    if "engine" in str(exc) and "unexpected keyword" in str(exc):
+        raise RuntimeError(
+            "This configuration requires PaddleOCR >=3.5 because it uses the "
+            "`engine` argument. Reinstall the selected project extra."
+        ) from exc
 
 
 class PaddleTextEngine:
@@ -14,20 +66,16 @@ class PaddleTextEngine:
 
     def __init__(self, settings: PaddleSettings) -> None:
         self.settings = settings
+        self.engine = settings.resolved_text_engine
         self._pipeline: Any = None
 
     def _get_pipeline(self) -> Any:
         if self._pipeline is None:
-            try:
-                from paddleocr import PaddleOCR
-            except ImportError as exc:  # pragma: no cover - deployment dependency
-                raise RuntimeError(
-                    "Install the paddle extra and a compatible PaddlePaddle build"
-                ) from exc
+            PaddleOCR = _load_paddle_symbol("PaddleOCR", self.engine)
             kwargs: dict[str, Any] = {
                 "lang": self.settings.language,
                 "device": self.settings.device,
-                "engine": self.settings.engine,
+                "engine": self.engine,
                 "text_det_thresh": self.settings.text_detection_threshold,
                 "text_det_box_thresh": self.settings.text_box_threshold,
                 "text_rec_score_thresh": self.settings.text_recognition_threshold,
@@ -40,7 +88,22 @@ class PaddleTextEngine:
                 kwargs["text_recognition_model_dir"] = (
                     self.settings.text_recognition_model_dir
                 )
-            self._pipeline = PaddleOCR(**kwargs)
+            try:
+                self._pipeline = PaddleOCR(**kwargs)
+            except TypeError as exc:
+                _raise_if_legacy_engine_argument(exc)
+                raise
+            except ValueError as exc:
+                _raise_model_format_error(
+                    exc,
+                    component="General OCR",
+                    engine=self.engine,
+                    model_directories=[
+                        self.settings.text_detection_model_dir,
+                        self.settings.text_recognition_model_dir,
+                    ],
+                )
+                raise
         return self._pipeline
 
     def extract(
@@ -82,26 +145,37 @@ class PaddleLayoutEngine:
 
     def __init__(self, settings: PaddleSettings) -> None:
         self.settings = settings
+        self.engine = settings.resolved_layout_engine
         self._pipeline: Any = None
 
     def _get_pipeline(self) -> Any:
         if self._pipeline is None:
-            try:
-                from paddleocr import PaddleOCRVL
-            except ImportError as exc:  # pragma: no cover - deployment dependency
-                raise RuntimeError(
-                    "PaddleOCR-VL is unavailable; install paddleocr[doc-parser]"
-                ) from exc
+            PaddleOCRVL = _load_paddle_symbol("PaddleOCRVL", self.engine)
             kwargs: dict[str, Any] = {
                 "device": self.settings.device,
-                "engine": self.settings.engine,
+                "engine": self.engine,
                 "layout_threshold": self.settings.layout_threshold,
             }
             if self.settings.layout_model_dir:
                 kwargs["layout_detection_model_dir"] = self.settings.layout_model_dir
             if self.settings.vl_rec_model_dir:
                 kwargs["vl_rec_model_dir"] = self.settings.vl_rec_model_dir
-            self._pipeline = PaddleOCRVL(**kwargs)
+            try:
+                self._pipeline = PaddleOCRVL(**kwargs)
+            except TypeError as exc:
+                _raise_if_legacy_engine_argument(exc)
+                raise
+            except ValueError as exc:
+                _raise_model_format_error(
+                    exc,
+                    component="Layout OCR",
+                    engine=self.engine,
+                    model_directories=[
+                        self.settings.layout_model_dir,
+                        self.settings.vl_rec_model_dir,
+                    ],
+                )
+                raise
         return self._pipeline
 
     def parse(

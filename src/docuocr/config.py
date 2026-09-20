@@ -9,6 +9,11 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+InferenceEngine = Literal[
+    "paddle", "paddle_static", "paddle_dynamic", "transformers", "onnxruntime"
+]
+
+
 class SettingsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -23,10 +28,12 @@ class PolicySettings(SettingsModel):
 
 class PaddleSettings(SettingsModel):
     enabled: bool = False
-    engine: Literal[
-        "paddle", "paddle_static", "paddle_dynamic", "transformers", "onnxruntime"
-    ] = "transformers"
-    device: str = "gpu:0"
+    text_enabled: bool = True
+    layout_enabled: bool = True
+    engine: InferenceEngine = "paddle"
+    text_engine: InferenceEngine | None = None
+    layout_engine: InferenceEngine | None = None
+    device: str = "cpu"
     language: str = "en"
     layout_model_dir: str | None = None
     vl_rec_model_dir: str | None = None
@@ -36,6 +43,22 @@ class PaddleSettings(SettingsModel):
     text_detection_threshold: float = Field(default=0.20, gt=0.0, le=1.0)
     text_box_threshold: float = Field(default=0.40, gt=0.0, le=1.0)
     text_recognition_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @property
+    def resolved_text_engine(self) -> InferenceEngine:
+        return self.text_engine or self.engine
+
+    @property
+    def resolved_layout_engine(self) -> InferenceEngine:
+        return self.layout_engine or self.engine
+
+    @model_validator(mode="after")
+    def require_enabled_component(self) -> PaddleSettings:
+        if self.enabled and not (self.text_enabled or self.layout_enabled):
+            raise ValueError(
+                "paddle.enabled requires text_enabled or layout_enabled"
+            )
+        return self
 
 
 class VLMSettings(SettingsModel):
@@ -88,12 +111,25 @@ class AppSettings(SettingsModel):
     def enforce_offline_model_paths(self) -> AppSettings:
         if not (self.offline and self.paddle.enabled):
             return self
-        required = {
-            "layout_model_dir": self.paddle.layout_model_dir,
-            "vl_rec_model_dir": self.paddle.vl_rec_model_dir,
-            "text_detection_model_dir": self.paddle.text_detection_model_dir,
-            "text_recognition_model_dir": self.paddle.text_recognition_model_dir,
-        }
+        required: dict[str, str | None] = {}
+        if self.paddle.text_enabled:
+            required.update(
+                {
+                    "text_detection_model_dir": (
+                        self.paddle.text_detection_model_dir
+                    ),
+                    "text_recognition_model_dir": (
+                        self.paddle.text_recognition_model_dir
+                    ),
+                }
+            )
+        if self.paddle.layout_enabled:
+            required.update(
+                {
+                    "layout_model_dir": self.paddle.layout_model_dir,
+                    "vl_rec_model_dir": self.paddle.vl_rec_model_dir,
+                }
+            )
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise ValueError(f"Offline Paddle mode requires explicit paths: {missing}")
