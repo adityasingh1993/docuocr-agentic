@@ -1,0 +1,42 @@
+{
+  "ocrSpans": [
+    {
+      "id": "placeholder-label",
+      "text": "First name",
+      "confidence": 0.99,
+      "bbox": {"x1": 50, "y1": 70, "x2": 190, "y2": 105},
+      "page": 1,
+      "source": "paddleocr",
+      "attempt": 0
+    },
+    {
+      "id": "placeholder-value",
+      "text": "Amina",
+      "confidence": 0.99,
+      "bbox": {"x1": 220, "y1": 70, "x2": 330, "y2": 105},
+      "page": 1,
+      "source": "paddleocr",
+      "attempt": 0
+    },
+    {
+      "id": "placeholder-serial-label",
+      "text": "Serial number",
+      "confidence": 0.98,
+      "bbox": {"x1": 50, "y1": 130, "x2": 200, "y2": 165},
+      "page": 1,
+      "source": "paddleocr",
+      "attempt": 0
+    },
+    {
+      "id": "placeholder-serial-value",
+      "text": "SN-42",
+      "confidence": 0.98,
+      "bbox": {"x1": 220, "y1": 130, "x2": 330, "y2": 165},
+      "page": 1,
+      "source": "paddleocr",
+      "attempt": 0
+    }
+  ],
+  "layoutBlocks": [],
+  "controls": []
+}

@@ -1,0 +1,104 @@
+id: newborn-screening-generic-v1
+version: "1.0"
+document_type: newborn_screening_form
+normalization:
+  date_order: DMY
+  weight_unit: kg
+anchors:
+  - newborn screening
+  - baby details
+  - sample collection
+
+fields:
+  data.baby.birthTime:
+    type: time
+    aliases: [birth time, time of birth, born at]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.baby.birthWeight:
+    type: weight
+    aliases: [birth weight, weight at birth]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.baby.dateOfBirth:
+    type: date
+    aliases: [date of birth, dob, birth date]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    critical: true
+  data.baby.firstName:
+    type: string
+    aliases: [baby first name, child first name, given name, first name]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    critical: true
+  data.baby.lastName:
+    type: string
+    aliases: [baby last name, child last name, family name, surname, last name]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    critical: true
+  data.baby.nationality:
+    type: string
+    aliases: [nationality, citizenship]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.baby.medication:
+    type: string
+    aliases: [medication, medicines, current medication]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.baby.parenteral:
+    type: string
+    aliases: [parenteral]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.baby.registerNumber:
+    type: string
+    aliases: [register number, registration number, registration no, reg no]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    critical: true
+  data.baby.sample.collection.date:
+    type: date
+    aliases: [collection date, sample collection date, date collected]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    critical: true
+  data.baby.sample.collection.time:
+    type: time
+    aliases: [collection time, sample collection time, time collected]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.payer.healthInsurance:
+    type: string
+    aliases: [health insurance, insurer, insurance]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+  data.serialNumber:
+    type: string
+    aliases: [serial number, serial no, card number, form number]
+    strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    critical: true
+
+checkbox_groups:
+  baby_sex:
+    exclusive: true
+    options:
+      male:
+        output_path: data.baby.male
+        aliases: [male, m]
+      female:
+        output_path: data.baby.female
+        aliases: [female, f]
+  consent_all_and_ngs:
+    exclusive: false
+    options:
+      consent:
+        output_path: data.babyConsentforAllAndNgsTracking
+        aliases: [consent for all and ngs tracking, ngs tracking consent]
+  first_screening:
+    exclusive: false
+    options:
+      first_time:
+        output_path: data.babyFirstTimeScreening
+        aliases: [first time screening, first screening]
+  hearing_screen:
+    exclusive: false
+    options:
+      performed:
+        output_path: data.babyHearingScreenPerformed
+        aliases: [hearing screen performed, hearing screening performed]
+
+validation:
+  birth_weight_kg: [0.3, 8.0]
+  sample_collection_not_before_birth: true
+  sex_mutually_exclusive: true
