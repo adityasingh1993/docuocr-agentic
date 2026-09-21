@@ -47,7 +47,19 @@ class GraphIntegrationTests(unittest.TestCase):
                             ),
                             _span("v2", "Amina", 220, 170, 330, 205, "ocr-engine-b"),
                         ],
-                        "layoutBlocks": [],
+                        "layoutBlocks": [
+                            {
+                                "id": "layout-raw",
+                                "label": "text",
+                                "confidence": 0.95,
+                                "bbox": {
+                                    "x1": 40,
+                                    "y1": 40,
+                                    "x2": 350,
+                                    "y2": 120,
+                                },
+                            }
+                        ],
                         "controls": [],
                     }
                 ),
@@ -96,11 +108,26 @@ class GraphIntegrationTests(unittest.TestCase):
                 )
             )
             self.assertEqual(len(evidence["ocrSpans"]), 4)
+            self.assertEqual(len(evidence["layoutBlocks"]), 1)
             self.assertTrue(evidence["records"])
             self.assertEqual(evidence["originalImagePath"], str(image_path.resolve()))
             self.assertEqual(evidence["activeImagePath"], str(image_path.resolve()))
             self.assertIn("qualityHistory", evidence)
             self.assertIn("enhancementEvaluations", evidence)
+            self.assertEqual(len(evidence["layoutVisualizations"]), 1)
+            visualization = evidence["layoutVisualizations"][0]
+            self.assertEqual(visualization["block_count"], 1)
+            self.assertEqual(visualization["rendered_block_count"], 1)
+            self.assertTrue(Path(visualization["output_path"]).is_file())
+            self.assertTrue(
+                (
+                    root
+                    / "artifacts"
+                    / "integration"
+                    / "images"
+                    / "layout-detected-0.png"
+                ).is_file()
+            )
             trace_nodes = {
                 json.loads(line)["node"]
                 for line in (

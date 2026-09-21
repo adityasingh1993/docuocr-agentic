@@ -54,6 +54,12 @@ class ConfigAndTraceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "text_enabled or layout_enabled"):
             PaddleSettings(enabled=True, text_enabled=False, layout_enabled=False)
 
+    def test_layout_images_can_be_disabled(self) -> None:
+        settings = AppSettings.model_validate(
+            {"trace": {"save_layout_images": False}}
+        )
+        self.assertFalse(settings.trace.save_layout_images)
+
     def test_trace_append_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"

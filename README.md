@@ -249,11 +249,18 @@ evidence.json
 images/
   original-reference.json
   document-candidate-*.png
+  layout-detected-*.png
   crop-*.png
 document-understanding.json  # when the VLM analysis succeeds
 ```
 
 The trace stores hashes, model/config identities, transformation parameters, routing decisions, and evidence references. Raw field values are omitted from trace records by default. The protected `evidence.json` ledger stores OCR text, boxes, controls, quality history, document understanding, enhancement evaluations, and hashes so each decision can be audited; treat it as sensitive data. The business output keeps normalized values in `data` and raw pre-normalization values in `meta.pre`.
+
+When `trace.save_layout_images` is enabled (the default), each layout pass saves
+an overlay of detected boxes, class labels, and confidence scores on the exact
+active image used for that pass. Extracted text is not drawn on the overlay. The
+source/output hashes and block counts are recorded in `layoutVisualizations` in
+`evidence.json`. Set `trace.save_layout_images: false` to disable these images.
 
 Full-page enhancement is deliberately non-generative. Qwen can recommend only
 `deskew`, `local_contrast`, `illumination_normalization`,

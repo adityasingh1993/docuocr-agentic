@@ -105,6 +105,7 @@ class VLMSettings(SettingsModel):
 class TraceSettings(SettingsModel):
     include_values: bool = False
     save_crops: bool = True
+    save_layout_images: bool = True
 
 
 class AppSettings(SettingsModel):

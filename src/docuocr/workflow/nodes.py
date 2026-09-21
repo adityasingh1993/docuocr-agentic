@@ -15,6 +15,7 @@ from docuocr.contract import (
     ProcessorStep,
 )
 from docuocr.cv.enhance import ImageEnhancer
+from docuocr.cv.layout_visualization import LayoutVisualizer
 from docuocr.cv.quality import (
     ImageQualityAssessor,
     assess_ocr_readiness,
@@ -67,6 +68,7 @@ class WorkflowNodes:
         self.vlm = vlm
         self.quality_assessor = ImageQualityAssessor()
         self.enhancer = ImageEnhancer()
+        self.layout_visualizer = LayoutVisualizer()
         self.scorer = ConfidenceScorer(settings.policy.accept_threshold)
         self.grounding = GroundingVerifier()
 
@@ -293,10 +295,36 @@ class WorkflowNodes:
                 state["active_image_path"], attempt=attempt, id_prefix=prefix
             )
             evidence = [_layout_evidence(item) for item in blocks]
+            visualizations: list[dict[str, Any]] = []
+            warnings: list[str] = []
+            if (
+                self.settings.trace.save_layout_images
+                and self.layout_engine.model_id != "disabled"
+            ):
+                output_path = (
+                    Path(state["run_dir"])
+                    / "images"
+                    / f"layout-detected-{attempt}.png"
+                )
+                try:
+                    record = self.layout_visualizer.render(
+                        state["active_image_path"],
+                        blocks,
+                        output_path,
+                        attempt=attempt,
+                    )
+                    visualizations.append(record.model_dump(mode="json"))
+                except Exception as exc:
+                    warnings.append(
+                        "layout_visualization_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
             return {
                 "layout_blocks": [item.model_dump(mode="json") for item in blocks],
                 "layout_ledger": [item.model_dump(mode="json") for item in blocks],
+                "layout_visualizations": visualizations,
                 "evidence": [item.model_dump(mode="json") for item in evidence],
+                "warnings": warnings,
                 "_stage_confidence": _mean([item.confidence for item in blocks]),
             }
 
@@ -757,6 +785,9 @@ class WorkflowNodes:
                         "records": state.get("evidence", []),
                         "ocrSpans": state.get("ocr_ledger", []),
                         "layoutBlocks": state.get("layout_ledger", []),
+                        "layoutVisualizations": state.get(
+                            "layout_visualizations", []
+                        ),
                         "controls": state.get("control_ledger", []),
                     },
                     ensure_ascii=False,

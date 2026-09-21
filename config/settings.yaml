@@ -47,3 +47,4 @@ vlm:
 trace:
   include_values: false
   save_crops: true
+  save_layout_images: true

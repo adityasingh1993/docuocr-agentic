@@ -70,6 +70,17 @@ class LayoutBlock(StrictModel):
     source: str = "paddleocr-vl"
 
 
+class LayoutVisualizationRecord(StrictModel):
+    source_path: str
+    output_path: str
+    source_sha256: str
+    output_sha256: str
+    block_count: int = Field(ge=0)
+    rendered_block_count: int = Field(ge=0)
+    label_counts: dict[str, int] = Field(default_factory=dict)
+    attempt: int = Field(default=0, ge=0)
+
+
 class ControlKind(StrEnum):
     CHECKBOX = "checkbox"
     RADIO = "radio"

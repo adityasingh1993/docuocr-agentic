@@ -160,6 +160,12 @@ The Pydantic contract serializes camelCase names such as `dateOfBirth`, `birthTi
 
 Patient values are not written into trace events by default. Evidence images should be encrypted at rest and deleted according to an explicit retention policy.
 
+When enabled, every layout pass also writes a diagnostic overlay on the exact
+active image used by that pass. The overlay contains only layout boxes, class
+labels, and confidence scores—not recognized text. Its source/output hashes and
+block counts are retained in `evidence.json`; the overlay never becomes an
+extraction input.
+
 ## 9. Runtime profiles
 
 ### Developer workstation
