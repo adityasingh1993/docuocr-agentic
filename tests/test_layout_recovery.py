@@ -9,12 +9,20 @@ from pathlib import Path
 
 import numpy as np
 
-from docuocr.config import AppSettings
+from docuocr.config import AppSettings, AssociationSettings
 from docuocr.engines.sidecar import NullLayoutEngine
+from docuocr.engines.vlm import VLMProposalResult
 from docuocr.extraction.blueprint import DocumentBlueprint
-from docuocr.models import BBox, OCRSpan, QualityReport, RecoveryAction, RecoveryPlan
+from docuocr.models import (
+    BBox,
+    LayoutBlock,
+    OCRSpan,
+    QualityReport,
+    RecoveryAction,
+    RecoveryPlan,
+)
 from docuocr.trace import sha256_file
-from docuocr.workflow.nodes import WorkflowNodes
+from docuocr.workflow.nodes import WorkflowNodes, _layout_recovery_tasks
 
 
 class _LayoutRecoveryTextEngine:
@@ -78,6 +86,17 @@ class _NoControls:
         return []
 
 
+class _CountingVLM:
+    model_id = "counting-vlm"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def propose(self, **kwargs: object) -> VLMProposalResult:
+        self.calls.append(list(kwargs["target_paths"]))  # type: ignore[arg-type]
+        return VLMProposalResult()
+
+
 class LayoutRecoveryTests(unittest.TestCase):
     def test_unresolved_fields_recover_from_matching_layouts_in_parallel(self) -> None:
         if importlib.util.find_spec("cv2") is None:
@@ -123,13 +142,14 @@ class LayoutRecoveryTests(unittest.TestCase):
                 }
             )
             engine = _LayoutRecoveryTextEngine()
+            vlm = _CountingVLM()
             nodes = WorkflowNodes(
                 settings=settings,
                 blueprint=blueprint,
                 text_engine=engine,
                 layout_engine=NullLayoutEngine(),
                 control_engine=_NoControls(),
-                vlm=None,
+                vlm=vlm,  # type: ignore[arg-type]
             )
             quality = QualityReport(
                 overall=0.8,
@@ -230,6 +250,67 @@ class LayoutRecoveryTests(unittest.TestCase):
             }
             self.assertEqual(values["data.baby.firstName"], "Amina")
             self.assertEqual(values["data.baby.registerNumber"], "REG-22")
+            self.assertEqual(vlm.calls, [])
+            self.assertTrue(all(not record["vlm_attempted"] for record in records))
+
+    def test_search_all_layouts_is_capped(self) -> None:
+        fields = {
+            f"data.field{index}": {
+                "aliases": [f"field {index} code"],
+                "strategies": ["right_of_label"],
+            }
+            for index in range(10)
+        }
+        blueprint = DocumentBlueprint.model_validate(
+            {
+                "id": "bounded-layout-search",
+                "version": "1",
+                "document_type": "test",
+                "fields": fields,
+            }
+        )
+        blocks = [
+            LayoutBlock(
+                id=f"layout:p1:{index:04d}",
+                label="text",
+                content=f"field {index} value",
+                confidence=0.9,
+                bbox=BBox(
+                    x1=10,
+                    y1=10 + index * 30,
+                    x2=300,
+                    y2=35 + index * 30,
+                ),
+            )
+            for index in range(10)
+        ]
+        plans = [
+            RecoveryPlan(
+                field_path=path,
+                actions=[RecoveryAction.UPSCALE, RecoveryAction.CLAHE],
+                attempt=1,
+            )
+            for path in fields
+        ]
+
+        tasks, unmatched = _layout_recovery_tasks(
+            plans=plans,
+            blocks=blocks,
+            spans=[],
+            blueprint=blueprint,
+            settings=AssociationSettings(max_layout_recovery_search_blocks=3),
+        )
+
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual(unmatched, [])
+        self.assertTrue(
+            all(
+                len(task.target_paths) == len(plans)
+                and len(task.selection_reasons) == len(plans)
+                and all(reason == "search" for _, reason in task.selection_reasons)
+                for task in tasks
+            )
+        )
 
 
 def _span(

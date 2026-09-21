@@ -542,12 +542,27 @@ class WorkflowNodes:
 
             baseline_spans = _models(OCRSpan, state.get("ocr_spans", []))
             controls = _models(FormControl, state.get("controls", []))
+            resolved_paths = {
+                item.path for item in existing if item.normalized_value is not None
+            }
+            ocr_block_ids = _layout_mapping_ocr_block_ids(
+                blocks=blocks,
+                spans=baseline_spans,
+                blueprint=self.blueprint,
+                unresolved_paths=[
+                    path
+                    for path in self.blueprint.output_paths
+                    if path not in resolved_paths
+                ],
+                settings=self.settings.association,
+            )
             processed, warnings = self.layout_block_processor.process(
                 image_path=state["active_image_path"],
                 run_dir=state["run_dir"],
                 blocks=blocks,
                 settings=self.settings.association,
                 attempt=attempt,
+                ocr_block_ids=ocr_block_ids,
             )
             recognized_spans = [
                 span for item in processed for span in item.recognized_spans
@@ -709,7 +724,7 @@ class WorkflowNodes:
             )
             evidence = _models(EvidenceRecord, state.get("evidence", []))
             evidence.append(image_evidence)
-            additions, warnings = self._vlm_candidates(
+            additions, warnings, _ = self._vlm_candidates(
                 image_path=active_image,
                 target_paths=target_paths,
                 spans=_models(OCRSpan, state.get("ocr_spans", [])),
@@ -865,7 +880,7 @@ class WorkflowNodes:
                 )
                 evidence.append(image_evidence)
                 new_evidence.append(image_evidence)
-                vlm_additions, vlm_warnings = self._vlm_candidates(
+                vlm_additions, vlm_warnings, _ = self._vlm_candidates(
                     image_path=active_image,
                     target_paths=target_paths,
                     spans=spans,
@@ -938,13 +953,22 @@ class WorkflowNodes:
                     "_decision": "no_recovery_plans",
                 }
 
-            if self.settings.association.layout_recovery_enabled:
+            if (
+                self.settings.association.layout_recovery_enabled
+                and attempt
+                <= self.settings.association.max_layout_recovery_attempts
+            ):
                 recovered, unmatched = self._recover_layouts(
                     state, plans, attempt
                 )
             else:
                 recovered = _empty_recovery_result(state)
-                recovered["warnings"].append("layout_recovery_disabled")
+                warning = (
+                    "layout_recovery_disabled"
+                    if not self.settings.association.layout_recovery_enabled
+                    else "layout_recovery_attempt_limit_reached"
+                )
+                recovered["warnings"].append(warning)
                 unmatched = plans
 
             if (
@@ -1240,7 +1264,7 @@ class WorkflowNodes:
         ]
         warnings: list[str] = []
         if self.vlm is not None:
-            additions, vlm_warnings = self._vlm_candidates(
+            additions, vlm_warnings, _ = self._vlm_candidates(
                 image_path=output,
                 target_paths=target_paths,
                 spans=spans,
@@ -1296,6 +1320,7 @@ class WorkflowNodes:
         control_ledger: list[dict[str, Any]] = []
         extraction_records: list[dict[str, Any]] = []
         quality = QualityReport.model_validate(state["quality"])
+        layout_vlm_blocks = 0
         for index, item in enumerate(recovered_blocks):
             task = item.task
             target_paths = list(task.target_paths)
@@ -1362,10 +1387,31 @@ class WorkflowNodes:
                     *[_control_evidence(control) for control in page_controls],
                     crop_evidence,
                 ]
-                if self.vlm is not None:
-                    additions, vlm_warnings = self._vlm_candidates(
+                vlm_target_paths = _layout_vlm_target_paths(
+                    task, candidates, local_spans, self.blueprint
+                )
+                vlm_attempted = False
+                vlm_request_count = 0
+                if (
+                    self.vlm is not None
+                    and self.settings.association.layout_recovery_vlm_enabled
+                    and vlm_target_paths
+                    and layout_vlm_blocks
+                    < self.settings.association.max_layout_vlm_blocks
+                ):
+                    request_paths = vlm_target_paths[
+                        : self.settings.vlm.max_paths_per_request
+                    ]
+                    if len(request_paths) < len(vlm_target_paths):
+                        warning = (
+                            "layout_recovery_vlm_path_budget_exhausted:"
+                            f"{task.block.id}"
+                        )
+                        warnings.append(warning)
+                        block_warnings.append(warning)
+                    additions, vlm_warnings, vlm_request_count = self._vlm_candidates(
                         image_path=item.crop_path,
-                        target_paths=target_paths,
+                        target_paths=request_paths,
                         spans=local_spans,
                         blocks=[],
                         controls=local_controls,
@@ -1375,12 +1421,29 @@ class WorkflowNodes:
                         image_evidence_id=crop_evidence.id,
                         document_context=_document_understanding(state),
                     )
+                    vlm_attempted = True
+                    layout_vlm_blocks += 1
                     candidates.extend(additions)
                     warnings.extend(vlm_warnings)
                     block_warnings.extend(vlm_warnings)
+                elif (
+                    self.vlm is not None
+                    and vlm_target_paths
+                    and layout_vlm_blocks
+                    >= self.settings.association.max_layout_vlm_blocks
+                ):
+                    warning = (
+                        "layout_recovery_vlm_block_budget_exhausted:"
+                        f"{task.block.id}"
+                    )
+                    warnings.append(warning)
+                    block_warnings.append(warning)
             else:
                 page_spans = []
                 page_controls = []
+                vlm_target_paths = []
+                vlm_attempted = False
+                vlm_request_count = 0
 
             candidate_paths = {
                 candidate.path
@@ -1415,6 +1478,9 @@ class WorkflowNodes:
                 control_ids=[control.id for control in page_controls],
                 controls=page_controls,
                 candidates=candidates,
+                vlm_attempted=vlm_attempted,
+                vlm_target_paths=vlm_target_paths,
+                vlm_request_count=vlm_request_count,
                 recognition_attempts=item.recognition_attempts,
                 status=status,
                 warnings=list(dict.fromkeys(block_warnings)),
@@ -1458,9 +1524,9 @@ class WorkflowNodes:
         visual_verification: bool,
         image_evidence_id: str | None = None,
         document_context: DocumentUnderstanding | None = None,
-    ) -> tuple[list[FieldCandidate], list[str]]:
+    ) -> tuple[list[FieldCandidate], list[str], int]:
         if self.vlm is None:
-            return [], []
+            return [], [], 0
         result = self.vlm.propose(
             image_path=image_path,
             target_paths=target_paths,
@@ -1489,7 +1555,7 @@ class WorkflowNodes:
                 )
             except GroundingError as exc:
                 warnings.append(f"rejected_vlm_proposal:{proposal.path}:{exc}")
-        return candidates, warnings
+        return candidates, warnings, result.request_count
 
     def _execute(
         self,
@@ -1625,27 +1691,38 @@ def _layout_recovery_tasks(
         for block in sorted(blocks, key=_layout_sort_key)
         if block.label.casefold().strip().replace(" ", "_") not in excluded
     ][: settings.max_layout_blocks]
-    assignments: dict[str, list[RecoveryPlan]] = {
+    assignments: dict[str, list[tuple[RecoveryPlan, str]]] = {
         block.id: [] for block in eligible
     }
+    search_plans: list[RecoveryPlan] = []
     unmatched: list[RecoveryPlan] = []
 
     for plan in plans:
         selected = _block_for_evidence_bbox(plan.bbox, eligible)
+        selection_reason = "evidence"
         if selected is None:
             aliases = _path_label_aliases(blueprint, plan.field_path)
             selected = _block_for_printed_label(aliases, eligible, spans)
+            selection_reason = "label"
 
         if selected is not None:
-            assignments[selected.id].append(plan)
+            assignments[selected.id].append((plan, selection_reason))
             continue
         if settings.layout_recovery_search_all_blocks and eligible:
-            # If the value and its label were both missed, each bounded layout is
-            # independently OCR'd. Mapping still targets only this unresolved path.
-            for block in eligible:
-                assignments[block.id].append(plan)
+            search_plans.append(plan)
             continue
         unmatched.append(plan)
+
+    # Search fallback is a global crop budget, not a per-field budget. Every
+    # unresolved path shares the same ranked crops so OCR runs only once per crop.
+    for block in _rank_layout_search_blocks(
+        search_plans,
+        blueprint,
+        eligible,
+        spans,
+        limit=settings.max_layout_recovery_search_blocks,
+    ):
+        assignments[block.id].extend((plan, "search") for plan in search_plans)
 
     tasks: list[LayoutRecoveryTask] = []
     for block in eligible:
@@ -1653,18 +1730,75 @@ def _layout_recovery_tasks(
         if not assigned:
             continue
         target_paths = tuple(
-            dict.fromkeys(plan.field_path for plan in assigned)
+            dict.fromkeys(plan.field_path for plan, _ in assigned)
         )
+        reason_by_path = {
+            plan.field_path: reason for plan, reason in assigned
+        }
+        assigned_plans = [plan for plan, _ in assigned]
         tasks.append(
             LayoutRecoveryTask(
                 block=block,
                 target_paths=target_paths,
                 actions=_layout_recovery_actions(
-                    assigned, target_paths, blueprint.checkbox_paths
+                    assigned_plans, target_paths, blueprint.checkbox_paths
+                ),
+                selection_reasons=tuple(
+                    (path, reason_by_path[path]) for path in target_paths
                 ),
             )
         )
     return tasks, unmatched
+
+
+def _layout_mapping_ocr_block_ids(
+    *,
+    blocks: list[LayoutBlock],
+    spans: list[OCRSpan],
+    blueprint: DocumentBlueprint,
+    unresolved_paths: list[str],
+    settings: AssociationSettings,
+) -> set[str]:
+    """Choose a small, document-wide budget of layouts for supplemental OCR."""
+
+    if settings.max_layout_ocr_blocks == 0 or not unresolved_paths:
+        return set()
+    excluded = {
+        item.casefold().strip().replace(" ", "_")
+        for item in settings.excluded_layout_labels
+    }
+    eligible = [
+        block
+        for block in sorted(blocks, key=_layout_sort_key)
+        if block.label.casefold().strip().replace(" ", "_") not in excluded
+    ][: settings.max_layout_blocks]
+    alias_groups = [
+        _path_label_aliases(blueprint, path) for path in unresolved_paths
+    ]
+    ranked: list[tuple[float, int, float, int, LayoutBlock]] = []
+    for index, block in enumerate(eligible):
+        block_spans = spans_in_region(spans, block)
+        relevance = max(
+            (
+                _block_printed_label_score(aliases, block, spans)
+                for aliases in alias_groups
+            ),
+            default=0.0,
+        )
+        ranked.append(
+            (
+                relevance,
+                int(not block_spans),
+                block.confidence,
+                -index,
+                block,
+            )
+        )
+    ranked.sort(key=lambda item: item[:4], reverse=True)
+    return {
+        item[4].id
+        for item in ranked[: settings.max_layout_ocr_blocks]
+    }
 
 
 def _layout_sort_key(block: LayoutBlock) -> tuple[int, int, int, int, str]:
@@ -1709,27 +1843,67 @@ def _block_for_printed_label(
         return None
     matches: list[tuple[float, int, LayoutBlock]] = []
     for block in blocks:
-        block_spans = sorted(
-            spans_in_region(spans, block),
-            key=lambda item: (item.bbox.y1, item.bbox.x1, item.id),
-        )
-        fragments = [block.content, *(span.text for span in block_spans)]
-        for start in range(len(block_spans)):
-            for length in range(2, min(4, len(block_spans) - start) + 1):
-                fragments.append(
-                    " ".join(
-                        item.text for item in block_spans[start : start + length]
-                    )
-                )
-        score = max(
-            (_printed_label_score(fragment, aliases) for fragment in fragments),
-            default=0.0,
-        )
+        score = _block_printed_label_score(aliases, block, spans)
         if score < 0.78:
             continue
         area = block.bbox.width * block.bbox.height
         matches.append((score, -area, block))
     return max(matches, key=lambda item: (item[0], item[1]))[2] if matches else None
+
+
+def _rank_layout_search_blocks(
+    plans: list[RecoveryPlan],
+    blueprint: DocumentBlueprint,
+    blocks: list[LayoutBlock],
+    spans: list[OCRSpan],
+    *,
+    limit: int,
+) -> list[LayoutBlock]:
+    if not plans:
+        return []
+    alias_groups = [
+        _path_label_aliases(blueprint, plan.field_path) for plan in plans
+    ]
+    ranked = [
+        (
+            max(
+                (
+                    _block_printed_label_score(aliases, block, spans)
+                    for aliases in alias_groups
+                ),
+                default=0.0,
+            ),
+            block.confidence,
+            -index,
+            block,
+        )
+        for index, block in enumerate(blocks)
+    ]
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [item[3] for item in ranked[:limit]]
+
+
+def _block_printed_label_score(
+    aliases: list[str], block: LayoutBlock, spans: list[OCRSpan]
+) -> float:
+    if not aliases:
+        return 0.0
+    block_spans = sorted(
+        spans_in_region(spans, block),
+        key=lambda item: (item.bbox.y1, item.bbox.x1, item.id),
+    )
+    fragments = [block.content, *(span.text for span in block_spans)]
+    for start in range(len(block_spans)):
+        for length in range(2, min(4, len(block_spans) - start) + 1):
+            fragments.append(
+                " ".join(
+                    item.text for item in block_spans[start : start + length]
+                )
+            )
+    return max(
+        (_printed_label_score(fragment, aliases) for fragment in fragments),
+        default=0.0,
+    )
 
 
 def _printed_label_score(text: str, aliases: list[str]) -> float:
@@ -1760,6 +1934,44 @@ def _path_label_aliases(
                 if len(canonical_text(alias)) > 1
             )
     return list(dict.fromkeys(aliases))
+
+
+def _layout_vlm_target_paths(
+    task: LayoutRecoveryTask,
+    candidates: list[FieldCandidate],
+    spans: list[OCRSpan],
+    blueprint: DocumentBlueprint,
+) -> list[str]:
+    """Use crop VLM only where local OCR gives a reason to inspect the crop."""
+
+    resolved = {
+        candidate.path
+        for candidate in candidates
+        if candidate.normalized_value is not None
+    }
+    selection_reasons = dict(task.selection_reasons)
+    result: list[str] = []
+    for path in task.target_paths:
+        if path in resolved:
+            continue
+        reason = selection_reasons.get(path, "search")
+        aliases = _path_label_aliases(blueprint, path)
+        if reason in {"evidence", "label"} or _spans_match_aliases(spans, aliases):
+            result.append(path)
+    return result
+
+
+def _spans_match_aliases(spans: list[OCRSpan], aliases: list[str]) -> bool:
+    if not spans or not aliases:
+        return False
+    ordered = sorted(spans, key=lambda item: (item.bbox.y1, item.bbox.x1, item.id))
+    fragments = [item.text for item in ordered]
+    for start in range(len(ordered)):
+        for length in range(2, min(4, len(ordered) - start) + 1):
+            fragments.append(
+                " ".join(item.text for item in ordered[start : start + length])
+            )
+    return any(_printed_label_score(text, aliases) >= 0.78 for text in fragments)
 
 
 def _layout_recovery_actions(

@@ -52,6 +52,18 @@ independently. OCR is parallelized with the same bounded worker pool, candidates
 are merged only after all selected blocks finish, and full-page recovery is an
 explicit opt-in fallback rather than the first retry.
 
+Baseline OCR is associated with every selected layout. Supplemental crop OCR is
+ranked against unresolved field labels and limited by `max_layout_ocr_blocks`, so
+all layouts remain in mapping and audit output without invoking the OCR model for
+every detected region.
+
+Latency is bounded at three levels: fallback recovery searches only a configured
+number of ranked blocks, deterministic layout recovery is not repeated beyond its
+configured attempt limit, and crop-level VLM is reserved for a small number of
+evidence-bearing unresolved blocks. Recursive VLM batch splitting also has a hard
+request budget, so a malformed response cannot expand into an unbounded binary
+tree of requests.
+
 ## 3. Bounded self-resolution
 
 The recovery planner chooses only from an enum of approved, deterministic actions:
@@ -78,7 +90,8 @@ thresholding are limited to targeted recovery crops.
 Every mapping and recovery pass appends a layout-extraction record containing the
 crop, raw OCR spans, controls, candidate values, target paths, status, and warnings.
 Assembly writes these records in layout order and then appends the final combined
-data and field decisions to `layout-extractions.json`.
+data and field decisions to `layout-extractions.json`. Recovery records also expose
+whether the VLM ran, its target paths, and the number of logical requests used.
 
 If fields remain unresolved after recovery, the final evidence pass targets only
 those paths. Deterministic mapping is rerun over the accumulated page and

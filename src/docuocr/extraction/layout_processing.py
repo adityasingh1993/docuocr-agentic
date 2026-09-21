@@ -35,6 +35,7 @@ class LayoutRecoveryTask:
     block: LayoutBlock
     target_paths: tuple[str, ...]
     actions: tuple[RecoveryAction, ...]
+    selection_reasons: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class LayoutBlockProcessor:
         blocks: list[LayoutBlock],
         settings: AssociationSettings,
         attempt: int,
+        ocr_block_ids: set[str] | None = None,
     ) -> tuple[list[ProcessedLayoutBlock], list[str]]:
         cv2 = _cv2()
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -91,6 +93,13 @@ class LayoutBlockProcessor:
         ]
         if not settings.layout_block_ocr_enabled or not selected:
             return base_results, []
+        ocr_selected = (
+            selected
+            if ocr_block_ids is None
+            else [item for item in selected if item[0].id in ocr_block_ids]
+        )
+        if not ocr_selected:
+            return base_results, []
         if not getattr(self.text_engine, "supports_region_ocr", False):
             return base_results, [
                 f"layout_block_ocr_unsupported:{self.text_engine.model_id}"
@@ -100,7 +109,13 @@ class LayoutBlockProcessor:
         crop_dir.mkdir(parents=True, exist_ok=True)
         prepared: list[_PreparedCrop] = []
         warnings: list[str] = []
-        for index, (block, bbox) in enumerate(selected):
+        if len(ocr_selected) < len(selected):
+            warnings.append(
+                f"layout_block_ocr_budget_applied:{len(ocr_selected)}/{len(selected)}"
+            )
+        selected_index = {block.id: index for index, (block, _) in enumerate(selected)}
+        for block, bbox in ocr_selected:
+            index = selected_index[block.id]
             crop_path = crop_dir / f"layout-block-{attempt}-{index:03d}.png"
             crop = image[bbox.y1 : bbox.y2, bbox.x1 : bbox.x2].copy()
             if crop.size == 0 or not cv2.imwrite(str(crop_path), crop):

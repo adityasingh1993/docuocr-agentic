@@ -10,7 +10,7 @@ policy:
   enhancement_min_ocr_gain: 0.02
   enhancement_min_text_retention: 0.80
   enhancement_min_control_retention: 0.75
-  max_field_retries: 2
+  max_field_retries: 1
   review_mode: queue
 
 paddle:
@@ -42,6 +42,7 @@ vlm:
   max_paths_per_request: 4
   max_controls_per_request: 32
   request_retries: 1
+  max_proposal_requests: 4
   allow_private_lan: false
 
 trace:
@@ -53,11 +54,16 @@ association:
   layout_blocks_enabled: true
   layout_block_ocr_enabled: true
   layout_recovery_enabled: true
+  max_layout_recovery_attempts: 1
   layout_recovery_search_all_blocks: true
+  max_layout_recovery_search_blocks: 4
+  layout_recovery_vlm_enabled: true
+  max_layout_vlm_blocks: 2
   whole_page_recovery_fallback: false
   layout_parallel_workers: 2
   layout_block_retries: 1
   max_layout_blocks: 24
+  max_layout_ocr_blocks: 6
   crop_padding_pixels: 12
   min_block_area_fraction: 0.001
   excluded_layout_labels: [image, header_image, figure, seal, stamp]

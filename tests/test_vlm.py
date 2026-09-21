@@ -186,6 +186,43 @@ class VLMClientTests(unittest.TestCase):
         )
         self.assertIn("invalid_json_response", result.warnings[0])
 
+    def test_malformed_response_splitting_obeys_request_budget(self) -> None:
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            return _response('{"proposals":[', finish_reason="length")
+
+        settings = VLMSettings(
+            enabled=True,
+            max_paths_per_request=4,
+            max_proposal_requests=2,
+            request_retries=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "form.png"
+            image.write_bytes(b"test")
+            result = LocalVLMClient(
+                settings, transport=httpx.MockTransport(handler)
+            ).propose(
+                image_path=image,
+                target_paths=[f"data.field{index}" for index in range(8)],
+                spans=[],
+                blocks=[],
+                controls=[],
+                image_evidence_id="image:test",
+            )
+
+        self.assertEqual(request_count, 2)
+        self.assertEqual(result.request_count, 2)
+        self.assertTrue(
+            any(
+                warning.startswith("vlm_request_budget_exhausted:")
+                for warning in result.warnings
+            )
+        )
+
     def test_decoder_accepts_fenced_json_and_rejects_length_finish(self) -> None:
         proposals = _decode_proposals(
             {

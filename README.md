@@ -89,6 +89,7 @@ vlm:
   max_paths_per_request: 4
   max_controls_per_request: 32
   request_retries: 1
+  max_proposal_requests: 4
   allow_private_lan: true
 ```
 
@@ -217,11 +218,16 @@ association:
   layout_blocks_enabled: true
   layout_block_ocr_enabled: true
   layout_recovery_enabled: true
+  max_layout_recovery_attempts: 1
   layout_recovery_search_all_blocks: true
+  max_layout_recovery_search_blocks: 4
+  layout_recovery_vlm_enabled: true
+  max_layout_vlm_blocks: 2
   whole_page_recovery_fallback: false
   layout_parallel_workers: 2
   layout_block_retries: 1
   max_layout_blocks: 24
+  max_layout_ocr_blocks: 6
   crop_padding_pixels: 12
   min_block_area_fraction: 0.001
   excluded_layout_labels: [image, header_image, figure, seal, stamp]
@@ -237,14 +243,30 @@ additional model memory for lower block-recognition latency. A failure is retrie
 per block according to `layout_block_retries`, and one failed block does not abort
 the document.
 
+All selected layouts are still mapped and written to the layout log, but
+supplemental crop OCR is limited to the `max_layout_ocr_blocks` most relevant
+unresolved regions (default `6`). Baseline full-page OCR is associated with every
+layout, so this avoids rerunning the same heavy OCR model across as many as 24
+crops without dropping other layouts from deterministic mapping or audit output.
+
 Field recovery is layout-first. A recovery plan selects the smallest block that
 contains its cited evidence, then falls back to a block containing one of the
 configured printed-label aliases. If both were missed,
-`layout_recovery_search_all_blocks: true` retries the eligible blocks separately
-and combines their candidates after recognition. This search remains bounded by
-`max_layout_blocks` and `layout_parallel_workers`. Whole-page field recovery is
-disabled by default; enable `whole_page_recovery_fallback` only when that explicit
-fallback is wanted. Set `layout_recovery_enabled: false` to disable layout recovery.
+`layout_recovery_search_all_blocks: true` retries likely eligible blocks separately
+and combines their candidates after recognition. The fallback fan-out is capped by
+`max_layout_recovery_search_blocks` (default `4`), while exact evidence/label matches
+still select their own block. `max_layout_recovery_attempts: 1` prevents repeating
+the same deterministic crop work on a second field retry.
+
+Crop-level Qwen is not called for every recovered layout. It runs only when a
+target remains unresolved and that crop was selected by evidence/label or its new
+OCR contains a matching printed label. `max_layout_vlm_blocks` caps those calls;
+each selected crop sends at most one configured path batch. At the VLM client
+level, `max_proposal_requests` caps recursive retries caused by truncated or
+malformed JSON. These bounds prevent the previous worst case of 24 layouts × 5
+field batches × multiple retries. Whole-page field recovery is disabled by default;
+enable `whole_page_recovery_fallback` only when that explicit fallback is wanted.
+Set `layout_recovery_enabled: false` to disable layout recovery.
 
 The evidence re-verification stage targets only unresolved paths and is bounded by
 `max_evidence_retries`. It can add candidates, but it cannot write directly to
@@ -324,7 +346,7 @@ are recorded in `evidenceReverifications`.
 
 `layout-extractions.json` is the layout-level extraction log. Every entry records
 the block bbox and crop, actual OCR spans and controls, target paths, mapped
-candidates, retry count, status, and warnings. Its final `combined` object records
+candidates, VLM targets/request count, retry count, status, and warnings. Its final `combined` object records
 the assembled `data`, accepted paths, unresolved paths, and field decisions. The
 same records are indexed from `evidence.json`, and the public result links the log
 through `meta.processors.layoutManifest`. Because it contains OCR text and field

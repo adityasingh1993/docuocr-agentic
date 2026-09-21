@@ -10,7 +10,7 @@ from docuocr.pipeline import DocumentPipeline
 
 
 def create_app(config_path: str, blueprint_path: str) -> FastAPI:
-    app = FastAPI(title="DocuOCR Agentic", version="0.3.1")
+    app = FastAPI(title="DocuOCR Agentic", version="0.3.2")
     pipeline = DocumentPipeline.from_files(config_path, blueprint_path)
 
     @app.on_event("shutdown")

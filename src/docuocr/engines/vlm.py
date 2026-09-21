@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -32,6 +33,7 @@ class VLMProposalResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposals: list[GroundedProposal] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    request_count: int = Field(default=0, ge=0)
 
 
 class VLMUnderstandingResult(BaseModel):
@@ -42,6 +44,18 @@ class VLMUnderstandingResult(BaseModel):
 
 class VLMResponseError(RuntimeError):
     """The local endpoint returned an unusable model response."""
+
+
+@dataclass
+class _RequestBudget:
+    limit: int
+    used: int = 0
+
+    def acquire(self) -> bool:
+        if self.used >= self.limit:
+            return False
+        self.used += 1
+        return True
 
 
 class LocalVLMClient:
@@ -78,6 +92,7 @@ class LocalVLMClient:
         encoded = base64.b64encode(resolved_image.read_bytes()).decode("ascii")
         hints = field_hints or {}
         result = VLMProposalResult()
+        budget = _RequestBudget(self.settings.max_proposal_requests)
         with httpx.Client(
             timeout=self.settings.timeout_seconds,
             transport=self._transport,
@@ -97,9 +112,11 @@ class LocalVLMClient:
                         path: hints[path] for path in batch_paths if path in hints
                     },
                     document_context=document_context,
+                    budget=budget,
                 )
                 result.proposals.extend(batch_result.proposals)
                 result.warnings.extend(batch_result.warnings)
+        result.request_count = budget.used
         return result
 
     def understand(
@@ -189,7 +206,17 @@ class LocalVLMClient:
         image_evidence_id: str | None,
         field_hints: dict[str, dict[str, Any]],
         document_context: DocumentUnderstanding | None,
+        budget: _RequestBudget,
     ) -> VLMProposalResult:
+        if not budget.acquire():
+            return VLMProposalResult(
+                warnings=[
+                    (
+                        "vlm_request_budget_exhausted:"
+                        f"{','.join(target_paths)}"
+                    )
+                ]
+            )
         try:
             proposals = self._request_batch(
                 client=client,
@@ -226,6 +253,7 @@ class LocalVLMClient:
                             if path in field_hints
                         },
                         document_context=document_context,
+                        budget=budget,
                     )
                     combined.proposals.extend(partial.proposals)
                     combined.warnings.extend(partial.warnings)

@@ -330,6 +330,9 @@ class LayoutExtractionRecord(StrictModel):
     control_ids: list[str] = Field(default_factory=list)
     controls: list[FormControl] = Field(default_factory=list)
     candidates: list[FieldCandidate] = Field(default_factory=list)
+    vlm_attempted: bool = False
+    vlm_target_paths: list[str] = Field(default_factory=list)
+    vlm_request_count: int = Field(default=0, ge=0)
     recognition_attempts: int = Field(default=0, ge=0)
     status: Literal["succeeded", "partial", "failed", "skipped"]
     warnings: list[str] = Field(default_factory=list)

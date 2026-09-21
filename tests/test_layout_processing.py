@@ -118,6 +118,49 @@ class LayoutBlockProcessingTests(unittest.TestCase):
             self.assertEqual(first.source, "fake-ocr:layout_crop")
             self.assertTrue(all(item.crop_path.is_file() for item in processed))  # type: ignore[union-attr]
 
+    def test_only_explicit_layouts_receive_supplemental_ocr(self) -> None:
+        if importlib.util.find_spec("cv2") is None:
+            self.skipTest("OpenCV is not installed")
+        import cv2
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "form.png"
+            image = np.full((220, 420, 3), 255, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), image))
+            blocks = [
+                LayoutBlock(
+                    id=f"layout:p1:{index:04d}",
+                    label="text",
+                    confidence=0.9,
+                    bbox=BBox(
+                        x1=20 + index * 200,
+                        y1=30,
+                        x2=180 + index * 200,
+                        y2=100,
+                    ),
+                )
+                for index in range(2)
+            ]
+            engine = _ParallelRetryTextEngine()
+
+            processed, warnings = LayoutBlockProcessor(engine).process(
+                image_path=image_path,
+                run_dir=root / "artifacts",
+                blocks=blocks,
+                settings=AssociationSettings(
+                    layout_block_retries=1,
+                    crop_padding_pixels=0,
+                ),
+                attempt=0,
+                ocr_block_ids={blocks[0].id},
+            )
+
+            self.assertEqual(len(engine.calls), 1)
+            self.assertIsNotNone(processed[0].record)
+            self.assertIsNone(processed[1].record)
+            self.assertIn("layout_block_ocr_budget_applied:1/2", warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

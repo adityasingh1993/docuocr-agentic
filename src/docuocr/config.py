@@ -27,7 +27,7 @@ class PolicySettings(SettingsModel):
     enhancement_min_control_retention: float = Field(
         default=0.75, ge=0.0, le=1.0
     )
-    max_field_retries: int = Field(default=2, ge=0, le=5)
+    max_field_retries: int = Field(default=1, ge=0, le=5)
     review_mode: Literal["queue", "interrupt"] = "queue"
 
 
@@ -77,6 +77,7 @@ class VLMSettings(SettingsModel):
     max_paths_per_request: int = Field(default=4, ge=1, le=32)
     max_controls_per_request: int = Field(default=32, ge=0, le=256)
     request_retries: int = Field(default=1, ge=0, le=3)
+    max_proposal_requests: int = Field(default=4, ge=1, le=32)
     allow_private_lan: bool = False
 
     @model_validator(mode="after")
@@ -112,11 +113,16 @@ class AssociationSettings(SettingsModel):
     layout_blocks_enabled: bool = True
     layout_block_ocr_enabled: bool = True
     layout_recovery_enabled: bool = True
+    max_layout_recovery_attempts: int = Field(default=1, ge=0, le=3)
     layout_recovery_search_all_blocks: bool = True
+    max_layout_recovery_search_blocks: int = Field(default=4, ge=1, le=24)
+    layout_recovery_vlm_enabled: bool = True
+    max_layout_vlm_blocks: int = Field(default=2, ge=0, le=8)
     whole_page_recovery_fallback: bool = False
     layout_parallel_workers: int = Field(default=2, ge=1, le=8)
     layout_block_retries: int = Field(default=1, ge=0, le=3)
     max_layout_blocks: int = Field(default=24, ge=1, le=100)
+    max_layout_ocr_blocks: int = Field(default=6, ge=0, le=100)
     crop_padding_pixels: int = Field(default=12, ge=0, le=256)
     min_block_area_fraction: float = Field(default=0.001, ge=0.0, le=0.25)
     excluded_layout_labels: list[str] = Field(
