@@ -52,6 +52,9 @@ trace:
 association:
   layout_blocks_enabled: true
   layout_block_ocr_enabled: true
+  layout_recovery_enabled: true
+  layout_recovery_search_all_blocks: true
+  whole_page_recovery_fallback: false
   layout_parallel_workers: 2
   layout_block_retries: 1
   max_layout_blocks: 24

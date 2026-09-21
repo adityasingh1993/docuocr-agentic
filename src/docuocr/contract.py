@@ -122,6 +122,7 @@ class ProcessorBundle(CamelModel):
     steps: list[ProcessorStep] = Field(default_factory=list)
     fields: dict[str, FieldDecisionMeta] = Field(default_factory=dict)
     evidence_manifest: str | None = None
+    layout_manifest: str | None = None
     trace_manifest: str | None = None
 
 

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from docuocr.config import AppSettings
+from docuocr.config import AppSettings, AssociationSettings
 from docuocr.contract import (
     ExtractionEnvelope,
     FieldDecisionMeta,
@@ -29,15 +29,22 @@ from docuocr.extraction.confidence import ConfidenceScorer
 from docuocr.extraction.grounding import GroundingError, GroundingVerifier
 from docuocr.extraction.layout_processing import (
     LayoutBlockProcessor,
+    LayoutRecoveryTask,
     controls_in_region,
     spans_in_region,
 )
-from docuocr.extraction.rules import associate_controls, map_rule_candidates
+from docuocr.extraction.rules import (
+    alias_score,
+    associate_controls,
+    canonical_text,
+    map_rule_candidates,
+)
 from docuocr.extraction.validation import validate_candidates
 from docuocr.models import (
     BBox,
     DocumentUnderstanding,
     EnhancementEvaluation,
+    EnhancementRecord,
     EvidenceKind,
     EvidenceRecord,
     EvidenceReverificationRecord,
@@ -45,6 +52,7 @@ from docuocr.models import (
     FieldDecision,
     FormControl,
     LayoutBlock,
+    LayoutExtractionRecord,
     OCRSpan,
     QualityReport,
     RecoveryAction,
@@ -545,6 +553,7 @@ class WorkflowNodes:
                 span for item in processed for span in item.recognized_spans
             ]
             local_candidates: list[FieldCandidate] = []
+            extraction_records: list[LayoutExtractionRecord] = []
             for item in processed:
                 block_spans = _unique_models_by_id(
                     [
@@ -553,11 +562,77 @@ class WorkflowNodes:
                     ]
                 )
                 block_controls = controls_in_region(controls, item.block)
-                local_candidates.extend(
-                    map_rule_candidates(
-                        self.blueprint,
-                        block_spans,
-                        block_controls,
+                block_candidates = map_rule_candidates(
+                    self.blueprint,
+                    block_spans,
+                    block_controls,
+                    attempt=attempt,
+                )
+                local_candidates.extend(block_candidates)
+                candidate_paths = {
+                    candidate.path
+                    for candidate in block_candidates
+                    if candidate.normalized_value is not None
+                }
+                block_warnings = [
+                    warning
+                    for warning in warnings
+                    if item.block.id in warning
+                    or warning.startswith(
+                        (
+                            "layout_block_ocr_unsupported:",
+                            "layout_parallelism_downgraded:",
+                        )
+                    )
+                ]
+                ocr_failed = (
+                    item.record is not None and item.record.status == "failed"
+                )
+                hard_failure = ocr_failed or any(
+                    warning.startswith(
+                        (
+                            "layout_block_crop_failed:",
+                            "layout_block_ocr_failed:",
+                            "layout_block_ocr_unsupported:",
+                        )
+                    )
+                    for warning in block_warnings
+                )
+                if hard_failure:
+                    status = "partial" if block_candidates else "failed"
+                elif block_warnings:
+                    status = "partial"
+                else:
+                    status = "succeeded"
+                extraction_records.append(
+                    LayoutExtractionRecord(
+                        id=f"layout-extraction:mapping:{attempt}:{item.block.id}",
+                        stage="mapping",
+                        block_id=item.block.id,
+                        block_label=item.block.label,
+                        block_source=item.block.source,
+                        page=item.block.page,
+                        bbox=item.crop_bbox,
+                        crop_path=(
+                            str(item.crop_path) if item.crop_path is not None else None
+                        ),
+                        target_paths=self.blueprint.output_paths,
+                        unresolved_target_paths=[
+                            path
+                            for path in self.blueprint.output_paths
+                            if path not in candidate_paths
+                        ],
+                        ocr_span_ids=[span.id for span in block_spans],
+                        ocr_spans=block_spans,
+                        control_ids=[control.id for control in block_controls],
+                        controls=block_controls,
+                        candidates=block_candidates,
+                        recognition_attempts=(
+                            item.record.recognition_attempts if item.record else 0
+                        ),
+                        status=status,
+                        warnings=block_warnings,
+                        model_id=self.text_engine.model_id,
                         attempt=attempt,
                     )
                 )
@@ -583,6 +658,9 @@ class WorkflowNodes:
                     item.model_dump(mode="json") for item in recognized_spans
                 ],
                 "layout_block_ocr": records,
+                "layout_extractions": [
+                    item.model_dump(mode="json") for item in extraction_records
+                ],
                 "evidence": [item.model_dump(mode="json") for item in evidence],
                 "candidates": [item.model_dump(mode="json") for item in merged],
                 "warnings": warnings,
@@ -857,13 +935,39 @@ class WorkflowNodes:
                 return {
                     "field_attempt": attempt,
                     "candidates": state.get("candidates", []),
+                    "_decision": "no_recovery_plans",
                 }
-            if attempt == 1:
-                recovered = self._recover_page(state, plans, attempt)
+
+            if self.settings.association.layout_recovery_enabled:
+                recovered, unmatched = self._recover_layouts(
+                    state, plans, attempt
+                )
             else:
-                recovered = self._recover_crops(state, plans, attempt)
+                recovered = _empty_recovery_result(state)
+                recovered["warnings"].append("layout_recovery_disabled")
+                unmatched = plans
+
+            if (
+                unmatched
+                and self.settings.association.whole_page_recovery_fallback
+            ):
+                page_recovery = self._recover_page(state, unmatched, attempt)
+                recovered = _combine_recovery_results(recovered, page_recovery)
+                recovery_mode = (
+                    "layout_then_whole_page_fallback"
+                    if len(unmatched) < len(plans)
+                    else "whole_page_fallback"
+                )
+            else:
+                recovery_mode = "layout"
+                recovered["warnings"].extend(
+                    f"layout_recovery_no_matching_block:{plan.field_path}"
+                    for plan in unmatched
+                )
+
             merged, reconciliation_warnings = _reconcile_visual_controls(
-                existing + recovered["candidates"], self.blueprint.checkbox_paths
+                _merge_candidates([*existing, *recovered["candidates"]]),
+                self.blueprint.checkbox_paths,
             )
             return {
                 "field_attempt": attempt,
@@ -874,13 +978,18 @@ class WorkflowNodes:
                 "evidence": recovered["evidence"],
                 "ocr_ledger": recovered["ocr_ledger"],
                 "control_ledger": recovered["control_ledger"],
+                "layout_extractions": recovered["layout_extractions"],
                 "candidates": [item.model_dump(mode="json") for item in merged],
                 "warnings": recovered["warnings"] + reconciliation_warnings,
-                "_decision": "rescore",
+                "_decision": f"rescore:{recovery_mode}",
             }
 
         return self._execute(
-            "recover", state, attempt, work, model_id="opencv+paddle+local-vlm"
+            "recover",
+            state,
+            attempt,
+            work,
+            model_id="layout-opencv+paddle+local-vlm",
         )
 
     def review(self, state: DocumentState) -> dict[str, Any]:
@@ -972,6 +1081,7 @@ class WorkflowNodes:
             }
             run_dir = Path(state["run_dir"])
             evidence_path = run_dir / "evidence.json"
+            layout_manifest_path = run_dir / "layout-extractions.json"
             evidence_path.write_text(
                 json.dumps(
                     {
@@ -997,6 +1107,10 @@ class WorkflowNodes:
                             "layout_visualizations", []
                         ),
                         "layoutBlockOCR": state.get("layout_block_ocr", []),
+                        "layoutExtractions": state.get(
+                            "layout_extractions", []
+                        ),
+                        "layoutExtractionManifest": str(layout_manifest_path),
                         "evidenceReverifications": state.get(
                             "evidence_reverifications", []
                         ),
@@ -1025,6 +1139,7 @@ class WorkflowNodes:
                             steps=processor_steps,
                             fields=field_meta,
                             evidence_manifest=str(evidence_path),
+                            layout_manifest=str(layout_manifest_path),
                             trace_manifest=str(run_dir / "trace.jsonl"),
                         ).model_dump(mode="json"),
                         "timing": {
@@ -1037,7 +1152,41 @@ class WorkflowNodes:
                     },
                 }
             )
-            return {"result": envelope.as_public_dict(), "_stage_confidence": 1.0}
+            result = envelope.as_public_dict()
+            corrected_paths = set(state.get("human_corrections", {}))
+            accepted_paths = sorted(
+                {
+                    path
+                    for path, decision in decisions.items()
+                    if decision.disposition == "accepted"
+                }
+                | corrected_paths
+            )
+            unresolved_paths = sorted(
+                path
+                for path, decision in decisions.items()
+                if decision.disposition != "accepted" and path not in corrected_paths
+            )
+            layout_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "layouts": state.get("layout_extractions", []),
+                        "combined": {
+                            "data": result["data"],
+                            "acceptedPaths": accepted_paths,
+                            "unresolvedPaths": unresolved_paths,
+                            "fieldDecisions": {
+                                path: decision.model_dump(mode="json")
+                                for path, decision in decisions.items()
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return {"result": result, "_stage_confidence": 1.0}
 
         return self._execute("assemble", state, state.get("field_attempt", 0), work)
 
@@ -1112,79 +1261,178 @@ class WorkflowNodes:
             "evidence": [item.model_dump(mode="json") for item in evidence],
             "ocr_ledger": [item.model_dump(mode="json") for item in spans],
             "control_ledger": [item.model_dump(mode="json") for item in controls],
+            "layout_extractions": [],
             "candidates": candidates,
             "warnings": warnings,
         }
 
-    def _recover_crops(
+    def _recover_layouts(
         self, state: DocumentState, plans: list[RecoveryPlan], attempt: int
-    ) -> dict[str, Any]:
-        run_dir = Path(state["run_dir"])
+    ) -> tuple[dict[str, Any], list[RecoveryPlan]]:
+        blocks = _models(LayoutBlock, state.get("layout_blocks", []))
+        spans = _models(OCRSpan, state.get("ocr_spans", []))
+        tasks, unmatched = _layout_recovery_tasks(
+            plans=plans,
+            blocks=blocks,
+            spans=spans,
+            blueprint=self.blueprint,
+            settings=self.settings.association,
+        )
+        if not tasks:
+            return _empty_recovery_result(state), unmatched
+
+        recovered_blocks, warnings = self.layout_block_processor.recover(
+            image_path=state["active_image_path"],
+            run_dir=state["run_dir"],
+            tasks=tasks,
+            settings=self.settings.association,
+            attempt=attempt,
+            enhancer=self.enhancer,
+        )
         all_candidates: list[FieldCandidate] = []
         all_evidence: list[EvidenceRecord] = []
         all_records: list[dict[str, Any]] = []
         ocr_ledger: list[dict[str, Any]] = []
         control_ledger: list[dict[str, Any]] = []
-        warnings: list[str] = []
-        for index, plan in enumerate(plans):
-            output = run_dir / "images" / f"recovery-{attempt}-{index:03d}.png"
-            record = self.enhancer.apply(
-                state["active_image_path"],
-                output,
-                plan.actions,
-                attempt=attempt,
-                bbox=plan.bbox,
-            )
-            prefix = f"retry{attempt}:{index:03d}"
-            spans = self.text_engine.extract(
-                output, attempt=attempt, id_prefix=f"ocr:{prefix}"
-            )
-            controls = self.control_engine.detect(
-                output, attempt=attempt, id_prefix=f"control:{prefix}"
-            )
-            controls = associate_controls(controls, spans)
-            candidates = map_rule_candidates(
-                self.blueprint,
-                spans,
-                controls,
-                attempt=attempt,
-                only_paths={plan.field_path},
-            )
-            crop_evidence = EvidenceRecord(
-                id=f"crop:{prefix}",
-                kind=EvidenceKind.CROP,
-                bbox=plan.bbox,
-                confidence=QualityReport.model_validate(state["quality"]).overall,
-                source="opencv_enhancement",
-                artifact_path=str(output),
-                artifact_sha256=record.output_sha256,
-                transform_chain=[record.strategy],
-            )
-            evidence = [
-                *[_ocr_evidence(item) for item in spans],
-                *[_control_evidence(item) for item in controls],
-                crop_evidence,
+        extraction_records: list[dict[str, Any]] = []
+        quality = QualityReport.model_validate(state["quality"])
+        for index, item in enumerate(recovered_blocks):
+            task = item.task
+            target_paths = list(task.target_paths)
+            block_warnings = [
+                warning
+                for warning in warnings
+                if task.block.id in warning
+                or warning.startswith("layout_parallelism_downgraded:")
             ]
-            if self.vlm is not None:
-                additions, vlm_warnings = self._vlm_candidates(
-                    image_path=output,
-                    target_paths=[plan.field_path],
-                    spans=spans,
-                    blocks=[],
-                    controls=controls,
-                    evidence=evidence,
-                    attempt=attempt,
-                    visual_verification=True,
-                    image_evidence_id=crop_evidence.id,
-                    document_context=_document_understanding(state),
+            local_spans = list(item.recognized_spans)
+            local_controls: list[FormControl] = []
+            candidates: list[FieldCandidate] = []
+            evidence: list[EvidenceRecord] = []
+            if item.crop_path is not None and item.enhancement is not None:
+                try:
+                    local_controls = self.control_engine.detect(
+                        item.crop_path,
+                        page=task.block.page,
+                        attempt=attempt,
+                        id_prefix=f"control:layout-recovery{attempt}:{index:03d}",
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate one layout failure
+                    warning = (
+                        "layout_recovery_controls_failed:"
+                        f"{task.block.id}:{type(exc).__name__}:{exc}"
+                    )
+                    warnings.append(warning)
+                    block_warnings.append(warning)
+                local_controls = associate_controls(
+                    local_controls, local_spans
                 )
-                candidates.extend(additions)
-                warnings.extend(vlm_warnings)
+                candidates = map_rule_candidates(
+                    self.blueprint,
+                    local_spans,
+                    local_controls,
+                    attempt=attempt,
+                    only_paths=set(target_paths),
+                )
+                page_spans = [
+                    _recovery_span_to_page(
+                        span, item.crop_bbox, item.enhancement
+                    )
+                    for span in local_spans
+                ]
+                page_controls = [
+                    _recovery_control_to_page(
+                        control, item.crop_bbox, item.enhancement
+                    )
+                    for control in local_controls
+                ]
+                crop_evidence = EvidenceRecord(
+                    id=f"crop:layout-recovery{attempt}:{index:03d}",
+                    kind=EvidenceKind.CROP,
+                    page=task.block.page,
+                    bbox=item.crop_bbox,
+                    confidence=_effective_quality(quality),
+                    source="opencv_layout_recovery",
+                    artifact_path=str(item.crop_path),
+                    artifact_sha256=item.enhancement.output_sha256,
+                    transform_chain=[item.enhancement.strategy],
+                )
+                evidence = [
+                    *[_ocr_evidence(span) for span in page_spans],
+                    *[_control_evidence(control) for control in page_controls],
+                    crop_evidence,
+                ]
+                if self.vlm is not None:
+                    additions, vlm_warnings = self._vlm_candidates(
+                        image_path=item.crop_path,
+                        target_paths=target_paths,
+                        spans=local_spans,
+                        blocks=[],
+                        controls=local_controls,
+                        evidence=evidence,
+                        attempt=attempt,
+                        visual_verification=True,
+                        image_evidence_id=crop_evidence.id,
+                        document_context=_document_understanding(state),
+                    )
+                    candidates.extend(additions)
+                    warnings.extend(vlm_warnings)
+                    block_warnings.extend(vlm_warnings)
+            else:
+                page_spans = []
+                page_controls = []
+
+            candidate_paths = {
+                candidate.path
+                for candidate in candidates
+                if candidate.normalized_value is not None
+            }
+            unresolved_target_paths = [
+                path for path in target_paths if path not in candidate_paths
+            ]
+            if item.error:
+                status = "partial" if candidates else "failed"
+            elif block_warnings or unresolved_target_paths:
+                status = "partial"
+            else:
+                status = "succeeded"
+            extraction = LayoutExtractionRecord(
+                id=(
+                    f"layout-extraction:recovery:{attempt}:"
+                    f"{task.block.id}"
+                ),
+                stage="recovery",
+                block_id=task.block.id,
+                block_label=task.block.label,
+                block_source=task.block.source,
+                page=task.block.page,
+                bbox=item.crop_bbox,
+                crop_path=(str(item.crop_path) if item.crop_path else None),
+                target_paths=target_paths,
+                unresolved_target_paths=unresolved_target_paths,
+                ocr_span_ids=[span.id for span in page_spans],
+                ocr_spans=page_spans,
+                control_ids=[control.id for control in page_controls],
+                controls=page_controls,
+                candidates=candidates,
+                recognition_attempts=item.recognition_attempts,
+                status=status,
+                warnings=list(dict.fromkeys(block_warnings)),
+                model_id=self.text_engine.model_id,
+                attempt=attempt,
+            )
+            extraction_records.append(extraction.model_dump(mode="json"))
             all_candidates.extend(candidates)
             all_evidence.extend(evidence)
-            ocr_ledger.extend(item.model_dump(mode="json") for item in spans)
-            control_ledger.extend(item.model_dump(mode="json") for item in controls)
-            all_records.append(record.model_dump(mode="json"))
+            ocr_ledger.extend(
+                span.model_dump(mode="json") for span in page_spans
+            )
+            control_ledger.extend(
+                control.model_dump(mode="json") for control in page_controls
+            )
+            if item.enhancement is not None:
+                all_records.append(item.enhancement.model_dump(mode="json"))
+
         return {
             "active_image_path": state["active_image_path"],
             "quality": state["quality"],
@@ -1192,9 +1440,10 @@ class WorkflowNodes:
             "evidence": [item.model_dump(mode="json") for item in all_evidence],
             "ocr_ledger": ocr_ledger,
             "control_ledger": control_ledger,
+            "layout_extractions": extraction_records,
             "candidates": all_candidates,
-            "warnings": warnings,
-        }
+            "warnings": list(dict.fromkeys(warnings)),
+        }, unmatched
 
     def _vlm_candidates(
         self,
@@ -1355,6 +1604,273 @@ class WorkflowNodes:
                 json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         return update
+
+
+def _layout_recovery_tasks(
+    *,
+    plans: list[RecoveryPlan],
+    blocks: list[LayoutBlock],
+    spans: list[OCRSpan],
+    blueprint: DocumentBlueprint,
+    settings: AssociationSettings,
+) -> tuple[list[LayoutRecoveryTask], list[RecoveryPlan]]:
+    """Assign each unresolved field to bounded layout crops, never implicitly a page."""
+
+    excluded = {
+        item.casefold().strip().replace(" ", "_")
+        for item in settings.excluded_layout_labels
+    }
+    eligible = [
+        block
+        for block in sorted(blocks, key=_layout_sort_key)
+        if block.label.casefold().strip().replace(" ", "_") not in excluded
+    ][: settings.max_layout_blocks]
+    assignments: dict[str, list[RecoveryPlan]] = {
+        block.id: [] for block in eligible
+    }
+    unmatched: list[RecoveryPlan] = []
+
+    for plan in plans:
+        selected = _block_for_evidence_bbox(plan.bbox, eligible)
+        if selected is None:
+            aliases = _path_label_aliases(blueprint, plan.field_path)
+            selected = _block_for_printed_label(aliases, eligible, spans)
+
+        if selected is not None:
+            assignments[selected.id].append(plan)
+            continue
+        if settings.layout_recovery_search_all_blocks and eligible:
+            # If the value and its label were both missed, each bounded layout is
+            # independently OCR'd. Mapping still targets only this unresolved path.
+            for block in eligible:
+                assignments[block.id].append(plan)
+            continue
+        unmatched.append(plan)
+
+    tasks: list[LayoutRecoveryTask] = []
+    for block in eligible:
+        assigned = assignments[block.id]
+        if not assigned:
+            continue
+        target_paths = tuple(
+            dict.fromkeys(plan.field_path for plan in assigned)
+        )
+        tasks.append(
+            LayoutRecoveryTask(
+                block=block,
+                target_paths=target_paths,
+                actions=_layout_recovery_actions(
+                    assigned, target_paths, blueprint.checkbox_paths
+                ),
+            )
+        )
+    return tasks, unmatched
+
+
+def _layout_sort_key(block: LayoutBlock) -> tuple[int, int, int, int, str]:
+    return (
+        block.page,
+        block.order if block.order is not None else 1_000_000,
+        block.bbox.y1,
+        block.bbox.x1,
+        block.id,
+    )
+
+
+def _block_for_evidence_bbox(
+    evidence_bbox: BBox | None, blocks: list[LayoutBlock]
+) -> LayoutBlock | None:
+    if evidence_bbox is None:
+        return None
+    evidence_area = evidence_bbox.width * evidence_bbox.height
+    center_x, center_y = evidence_bbox.center
+    matches: list[tuple[float, int, LayoutBlock]] = []
+    for block in blocks:
+        box = block.bbox
+        intersection = _intersection_area(evidence_bbox, box)
+        if intersection <= 0:
+            continue
+        coverage = intersection / max(1, evidence_area)
+        center_inside = box.x1 <= center_x <= box.x2 and box.y1 <= center_y <= box.y2
+        block_area = box.width * box.height
+        if coverage < 0.35 and not (
+            center_inside and evidence_area <= block_area * 4
+        ):
+            continue
+        score = coverage + (0.25 if center_inside else 0.0)
+        matches.append((score, -block_area, block))
+    return max(matches, key=lambda item: (item[0], item[1]))[2] if matches else None
+
+
+def _block_for_printed_label(
+    aliases: list[str], blocks: list[LayoutBlock], spans: list[OCRSpan]
+) -> LayoutBlock | None:
+    if not aliases:
+        return None
+    matches: list[tuple[float, int, LayoutBlock]] = []
+    for block in blocks:
+        block_spans = sorted(
+            spans_in_region(spans, block),
+            key=lambda item: (item.bbox.y1, item.bbox.x1, item.id),
+        )
+        fragments = [block.content, *(span.text for span in block_spans)]
+        for start in range(len(block_spans)):
+            for length in range(2, min(4, len(block_spans) - start) + 1):
+                fragments.append(
+                    " ".join(
+                        item.text for item in block_spans[start : start + length]
+                    )
+                )
+        score = max(
+            (_printed_label_score(fragment, aliases) for fragment in fragments),
+            default=0.0,
+        )
+        if score < 0.78:
+            continue
+        area = block.bbox.width * block.bbox.height
+        matches.append((score, -area, block))
+    return max(matches, key=lambda item: (item[0], item[1]))[2] if matches else None
+
+
+def _printed_label_score(text: str, aliases: list[str]) -> float:
+    score = alias_score(text, aliases)
+    normalized = canonical_text(text)
+    for alias in aliases:
+        target = canonical_text(alias)
+        if target and target in normalized:
+            score = max(score, 1.0 if target == normalized else 0.96)
+    return score
+
+
+def _path_label_aliases(
+    blueprint: DocumentBlueprint, field_path: str
+) -> list[str]:
+    spec = blueprint.fields.get(field_path)
+    if spec is not None:
+        return list(dict.fromkeys([*spec.aliases, *spec.group_aliases]))
+    aliases: list[str] = []
+    for group in blueprint.checkbox_groups.values():
+        for option in group.options.values():
+            if option.output_path != field_path:
+                continue
+            aliases.extend(group.aliases)
+            aliases.extend(
+                alias
+                for alias in option.aliases
+                if len(canonical_text(alias)) > 1
+            )
+    return list(dict.fromkeys(aliases))
+
+
+def _layout_recovery_actions(
+    plans: list[RecoveryPlan],
+    target_paths: tuple[str, ...],
+    checkbox_paths: set[str],
+) -> tuple[RecoveryAction, ...]:
+    requested = list(
+        dict.fromkeys(action for plan in plans for action in plan.actions)
+    )
+    checkbox_only = bool(target_paths) and all(
+        path in checkbox_paths for path in target_paths
+    )
+    if checkbox_only:
+        allowed = [
+            action for action in requested if action != RecoveryAction.REVIEW
+        ]
+        if RecoveryAction.CHECKBOX_FOCUS not in allowed:
+            allowed.insert(0, RecoveryAction.CHECKBOX_FOCUS)
+    else:
+        destructive = {
+            RecoveryAction.ADAPTIVE_BINARIZE,
+            RecoveryAction.CHECKBOX_FOCUS,
+            RecoveryAction.REVIEW,
+        }
+        allowed = [action for action in requested if action not in destructive]
+        if RecoveryAction.CLAHE not in allowed:
+            allowed.append(RecoveryAction.CLAHE)
+    if RecoveryAction.UPSCALE not in allowed:
+        allowed.insert(0, RecoveryAction.UPSCALE)
+    return tuple(dict.fromkeys(allowed))
+
+
+def _intersection_area(left: BBox, right: BBox) -> int:
+    return max(0, min(left.x2, right.x2) - max(left.x1, right.x1)) * max(
+        0, min(left.y2, right.y2) - max(left.y1, right.y1)
+    )
+
+
+def _recovery_span_to_page(
+    span: OCRSpan, crop_bbox: BBox, enhancement: EnhancementRecord
+) -> OCRSpan:
+    return span.model_copy(
+        update={"bbox": _recovery_bbox_to_page(span.bbox, crop_bbox, enhancement)}
+    )
+
+
+def _recovery_control_to_page(
+    control: FormControl, crop_bbox: BBox, enhancement: EnhancementRecord
+) -> FormControl:
+    return control.model_copy(
+        update={"bbox": _recovery_bbox_to_page(control.bbox, crop_bbox, enhancement)}
+    )
+
+
+def _recovery_bbox_to_page(
+    local: BBox, crop_bbox: BBox, enhancement: EnhancementRecord
+) -> BBox:
+    raw_scale = enhancement.parameters.get("upscale", 1.0)
+    scale = (
+        float(raw_scale)
+        if isinstance(raw_scale, int | float) and raw_scale > 0
+        else 1.0
+    )
+    local_x1 = int(round(local.x1 / scale))
+    local_y1 = int(round(local.y1 / scale))
+    local_x2 = int(round(local.x2 / scale))
+    local_y2 = int(round(local.y2 / scale))
+    x1 = min(max(crop_bbox.x1 + local_x1, crop_bbox.x1), crop_bbox.x2 - 1)
+    y1 = min(max(crop_bbox.y1 + local_y1, crop_bbox.y1), crop_bbox.y2 - 1)
+    x2 = min(max(crop_bbox.x1 + local_x2, x1 + 1), crop_bbox.x2)
+    y2 = min(max(crop_bbox.y1 + local_y2, y1 + 1), crop_bbox.y2)
+    return BBox(x1=x1, y1=y1, x2=x2, y2=y2)
+
+
+def _empty_recovery_result(state: DocumentState) -> dict[str, Any]:
+    return {
+        "active_image_path": state["active_image_path"],
+        "quality": state["quality"],
+        "enhancements": [],
+        "evidence": [],
+        "ocr_ledger": [],
+        "control_ledger": [],
+        "layout_extractions": [],
+        "candidates": [],
+        "warnings": [],
+    }
+
+
+def _combine_recovery_results(
+    first: dict[str, Any], second: dict[str, Any]
+) -> dict[str, Any]:
+    combined = {
+        "active_image_path": second.get(
+            "active_image_path", first["active_image_path"]
+        ),
+        "quality": second.get("quality", first["quality"]),
+    }
+    for key in (
+        "enhancements",
+        "evidence",
+        "ocr_ledger",
+        "control_ledger",
+        "layout_extractions",
+        "candidates",
+    ):
+        combined[key] = [*first.get(key, []), *second.get(key, [])]
+    combined["warnings"] = list(
+        dict.fromkeys([*first.get("warnings", []), *second.get("warnings", [])])
+    )
+    return combined
 
 
 def _reconcile_visual_controls(

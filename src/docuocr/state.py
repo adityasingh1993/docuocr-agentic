@@ -35,6 +35,7 @@ class DocumentState(TypedDict, total=False):
     layout_blocks: list[dict[str, Any]]
     layout_visualizations: Annotated[list[dict[str, Any]], operator.add]
     layout_block_ocr: Annotated[list[dict[str, Any]], operator.add]
+    layout_extractions: Annotated[list[dict[str, Any]], operator.add]
     ocr_spans: list[dict[str, Any]]
     controls: list[dict[str, Any]]
     layout_ledger: Annotated[list[dict[str, Any]], operator.add]

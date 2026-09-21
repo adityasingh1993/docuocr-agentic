@@ -6,11 +6,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from docuocr.config import AssociationSettings
-from docuocr.engines.base import TextEngine
-from docuocr.models import BBox, FormControl, LayoutBlock, LayoutBlockOCRRecord, OCRSpan
-from docuocr.trace import sha256_file
-
+from docuocr.cv.enhance import ImageEnhancer
 from docuocr.cv.quality import _cv2
+from docuocr.engines.base import TextEngine
+from docuocr.models import (
+    BBox,
+    EnhancementRecord,
+    FormControl,
+    LayoutBlock,
+    LayoutBlockOCRRecord,
+    OCRSpan,
+    RecoveryAction,
+)
+from docuocr.trace import sha256_file
 
 
 @dataclass(frozen=True)
@@ -20,6 +28,24 @@ class ProcessedLayoutBlock:
     crop_path: Path | None
     recognized_spans: tuple[OCRSpan, ...] = ()
     record: LayoutBlockOCRRecord | None = None
+
+
+@dataclass(frozen=True)
+class LayoutRecoveryTask:
+    block: LayoutBlock
+    target_paths: tuple[str, ...]
+    actions: tuple[RecoveryAction, ...]
+
+
+@dataclass(frozen=True)
+class RecoveredLayoutBlock:
+    task: LayoutRecoveryTask
+    crop_bbox: BBox
+    crop_path: Path | None
+    enhancement: EnhancementRecord | None
+    recognized_spans: tuple[OCRSpan, ...] = ()
+    recognition_attempts: int = 0
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,40 +115,16 @@ class LayoutBlockProcessor:
                 )
             )
 
-        requested_workers = min(settings.layout_parallel_workers, len(prepared))
-        fork = getattr(self.text_engine, "fork", None)
-        workers = requested_workers
-        if workers > 1 and not callable(fork):
-            workers = 1
-            warnings.append(
-                f"layout_parallelism_downgraded:{self.text_engine.model_id}"
-            )
-
-        if workers > 1:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="layout-ocr"
-            ) as executor:
-                outcomes = list(
-                    executor.map(
-                        lambda task: self._recognize(
-                            task,
-                            attempt=attempt,
-                            retries=settings.layout_block_retries,
-                            isolated=True,
-                        ),
-                        prepared,
-                    )
-                )
-        else:
-            outcomes = [
-                self._recognize(
-                    task,
-                    attempt=attempt,
-                    retries=settings.layout_block_retries,
-                    isolated=False,
-                )
-                for task in prepared
-            ]
+        outcomes, recognition_warnings = self._recognize_many(
+            prepared,
+            attempt=attempt,
+            workers=settings.layout_parallel_workers,
+            retries=settings.layout_block_retries,
+            id_scope="layout",
+            source_suffix="layout_crop",
+            translate_to_page=True,
+        )
+        warnings.extend(recognition_warnings)
 
         processed_by_index = {item.block.id: item for item in base_results}
         for task, outcome in zip(prepared, outcomes, strict=True):
@@ -152,6 +154,158 @@ class LayoutBlockProcessor:
             )
         return [processed_by_index[item.id] for item, _ in selected], warnings
 
+    def recover(
+        self,
+        *,
+        image_path: str | Path,
+        run_dir: str | Path,
+        tasks: list[LayoutRecoveryTask],
+        settings: AssociationSettings,
+        attempt: int,
+        enhancer: ImageEnhancer,
+    ) -> tuple[list[RecoveredLayoutBlock], list[str]]:
+        """Enhance and OCR only the selected layout blocks."""
+
+        if not tasks:
+            return [], []
+        if not getattr(self.text_engine, "supports_region_ocr", False):
+            warning = f"layout_recovery_ocr_unsupported:{self.text_engine.model_id}"
+            return [
+                RecoveredLayoutBlock(
+                    task=task,
+                    crop_bbox=task.block.bbox,
+                    crop_path=None,
+                    enhancement=None,
+                    error=warning,
+                )
+                for task in tasks
+            ], [warning]
+
+        crop_dir = Path(run_dir) / "images" / "layout-recovery"
+        crop_dir.mkdir(parents=True, exist_ok=True)
+        prepared: list[_PreparedCrop] = []
+        enhancements: dict[int, EnhancementRecord] = {}
+        results: dict[int, RecoveredLayoutBlock] = {}
+        warnings: list[str] = []
+        for index, task in enumerate(tasks):
+            crop_path = crop_dir / f"layout-recovery-{attempt}-{index:03d}.png"
+            try:
+                record = enhancer.apply(
+                    image_path,
+                    crop_path,
+                    task.actions,
+                    attempt=attempt,
+                    bbox=task.block.bbox,
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one layout failure
+                error = _safe_error(exc)
+                warnings.append(
+                    f"layout_recovery_enhancement_failed:{task.block.id}:{error}"
+                )
+                results[index] = RecoveredLayoutBlock(
+                    task=task,
+                    crop_bbox=task.block.bbox,
+                    crop_path=None,
+                    enhancement=None,
+                    error=error,
+                )
+                continue
+            crop_bbox = record.target_bbox or task.block.bbox
+            enhancements[index] = record
+            prepared.append(
+                _PreparedCrop(
+                    index=index,
+                    block=task.block,
+                    crop_bbox=crop_bbox,
+                    crop_path=crop_path,
+                )
+            )
+
+        outcomes, recognition_warnings = self._recognize_many(
+            prepared,
+            attempt=attempt,
+            workers=settings.layout_parallel_workers,
+            retries=settings.layout_block_retries,
+            id_scope="layout-recovery",
+            source_suffix=f"layout_recovery:{attempt}",
+            translate_to_page=False,
+        )
+        warnings.extend(recognition_warnings)
+        tasks_by_index = {index: task for index, task in enumerate(tasks)}
+        for prepared_crop, outcome in zip(prepared, outcomes, strict=True):
+            task = tasks_by_index[prepared_crop.index]
+            if outcome.error:
+                warnings.append(
+                    "layout_recovery_ocr_failed:"
+                    f"{task.block.id}:{outcome.error}"
+                )
+            results[prepared_crop.index] = RecoveredLayoutBlock(
+                task=task,
+                crop_bbox=prepared_crop.crop_bbox,
+                crop_path=prepared_crop.crop_path,
+                enhancement=enhancements[prepared_crop.index],
+                recognized_spans=outcome.spans,
+                recognition_attempts=outcome.attempts,
+                error=outcome.error,
+            )
+        return [results[index] for index in range(len(tasks))], warnings
+
+    def _recognize_many(
+        self,
+        prepared: list[_PreparedCrop],
+        *,
+        attempt: int,
+        workers: int,
+        retries: int,
+        id_scope: str,
+        source_suffix: str,
+        translate_to_page: bool,
+    ) -> tuple[list[_RecognitionOutcome], list[str]]:
+        if not prepared:
+            return [], []
+        requested_workers = min(workers, len(prepared))
+        fork = getattr(self.text_engine, "fork", None)
+        actual_workers = requested_workers
+        warnings: list[str] = []
+        if actual_workers > 1 and not callable(fork):
+            actual_workers = 1
+            warnings.append(
+                f"layout_parallelism_downgraded:{self.text_engine.model_id}"
+            )
+
+        if actual_workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=actual_workers, thread_name_prefix="layout-ocr"
+            ) as executor:
+                outcomes = list(
+                    executor.map(
+                        lambda task: self._recognize(
+                            task,
+                            attempt=attempt,
+                            retries=retries,
+                            isolated=True,
+                            id_scope=id_scope,
+                            source_suffix=source_suffix,
+                            translate_to_page=translate_to_page,
+                        ),
+                        prepared,
+                    )
+                )
+        else:
+            outcomes = [
+                self._recognize(
+                    task,
+                    attempt=attempt,
+                    retries=retries,
+                    isolated=False,
+                    id_scope=id_scope,
+                    source_suffix=source_suffix,
+                    translate_to_page=translate_to_page,
+                )
+                for task in prepared
+            ]
+        return outcomes, warnings
+
     def _recognize(
         self,
         task: _PreparedCrop,
@@ -159,6 +313,9 @@ class LayoutBlockProcessor:
         attempt: int,
         retries: int,
         isolated: bool,
+        id_scope: str,
+        source_suffix: str,
+        translate_to_page: bool,
     ) -> _RecognitionOutcome:
         engine = self._engine_for_worker(isolated)
         last_error: Exception | None = None
@@ -168,22 +325,30 @@ class LayoutBlockProcessor:
                     task.crop_path,
                     page=task.block.page,
                     attempt=attempt,
-                    id_prefix=f"ocr:layout{attempt}:{task.index:03d}",
+                    id_prefix=f"ocr:{id_scope}{attempt}:{task.index:03d}",
                 )
-                translated = tuple(
-                    _translate_span(item, task.crop_bbox) for item in local_spans
-                )
+                if translate_to_page:
+                    recognized = tuple(
+                        _translate_span(item, task.crop_bbox, source_suffix)
+                        for item in local_spans
+                    )
+                else:
+                    recognized = tuple(
+                        item.model_copy(
+                            update={"source": f"{item.source}:{source_suffix}"}
+                        )
+                        for item in local_spans
+                    )
                 return _RecognitionOutcome(
-                    spans=translated, attempts=recognition_attempt
+                    spans=recognized, attempts=recognition_attempt
                 )
             except Exception as exc:  # isolate one region from the document run
                 last_error = exc
         assert last_error is not None
-        message = " ".join(str(last_error).split())[:240]
         return _RecognitionOutcome(
             spans=(),
             attempts=retries + 1,
-            error=f"{type(last_error).__name__}:{message}",
+            error=_safe_error(last_error),
         )
 
     def _engine_for_worker(self, isolated: bool) -> TextEngine:
@@ -270,7 +435,7 @@ def _belongs_to_region(item: BBox, region: BBox) -> bool:
     return intersection / max(1, item.width * item.height) >= 0.35
 
 
-def _translate_span(span: OCRSpan, crop_bbox: BBox) -> OCRSpan:
+def _translate_span(span: OCRSpan, crop_bbox: BBox, source_suffix: str) -> OCRSpan:
     width = crop_bbox.width
     height = crop_bbox.height
     x1 = min(max(span.bbox.x1, 0), width - 1)
@@ -285,9 +450,14 @@ def _translate_span(span: OCRSpan, crop_bbox: BBox) -> OCRSpan:
                 x2=crop_bbox.x1 + x2,
                 y2=crop_bbox.y1 + y2,
             ),
-            "source": f"{span.source}:layout_crop",
+            "source": f"{span.source}:{source_suffix}",
         }
     )
+
+
+def _safe_error(exc: Exception) -> str:
+    message = " ".join(str(exc).split())[:240]
+    return f"{type(exc).__name__}:{message}"
 
 
 def _clamped_expanded_bbox(

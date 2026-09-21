@@ -73,6 +73,9 @@ class ConfigAndTraceTests(unittest.TestCase):
         self.assertEqual(settings.association.layout_parallel_workers, 3)
         self.assertEqual(settings.association.layout_block_retries, 2)
         self.assertEqual(settings.association.max_evidence_retries, 2)
+        self.assertTrue(settings.association.layout_recovery_enabled)
+        self.assertTrue(settings.association.layout_recovery_search_all_blocks)
+        self.assertFalse(settings.association.whole_page_recovery_fallback)
 
     def test_trace_append_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -45,6 +45,7 @@ The public object contains exactly `data` and `meta`. All fields are present thr
       "steps": [],
       "fields": {},
       "evidenceManifest": "artifacts/job-42/evidence.json",
+      "layoutManifest": "artifacts/job-42/layout-extractions.json",
       "traceManifest": "artifacts/job-42/trace.jsonl"
     },
     "timing": {
@@ -59,3 +60,9 @@ The public object contains exactly `data` and `meta`. All fields are present thr
 ```
 
 Timings are milliseconds. `meta.processors.fields` is keyed by canonical dotted path and records confidence, calibration status, disposition, attempts, evidence references, validation codes, and source. It is the decision/audit layer without changing the requested business-data hierarchy.
+
+`meta.processors.layoutManifest` points to a protected audit file whose `layouts`
+array records OCR spans, controls, candidates, retries, and warnings per layout
+block. Its final `combined` object contains the assembled data, accepted and
+unresolved paths, and field decisions. The file contains extracted values and must
+be handled with the same controls as `evidence.json`.

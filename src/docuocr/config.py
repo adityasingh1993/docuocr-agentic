@@ -111,6 +111,9 @@ class TraceSettings(SettingsModel):
 class AssociationSettings(SettingsModel):
     layout_blocks_enabled: bool = True
     layout_block_ocr_enabled: bool = True
+    layout_recovery_enabled: bool = True
+    layout_recovery_search_all_blocks: bool = True
+    whole_page_recovery_fallback: bool = False
     layout_parallel_workers: int = Field(default=2, ge=1, le=8)
     layout_block_retries: int = Field(default=1, ge=0, le=3)
     max_layout_blocks: int = Field(default=24, ge=1, le=100)

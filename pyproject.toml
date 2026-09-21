@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "docuocr-agentic"
-version = "0.3.0"
+version = "0.3.1"
 description = "Private, evidence-grounded, agentic form extraction with PaddleOCR, OpenCV, local VLMs, LangGraph, and Pydantic."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

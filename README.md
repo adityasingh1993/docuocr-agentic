@@ -17,7 +17,7 @@ The repository is deliberately **bounded-agentic**. LangGraph can retry approved
 6. Resolve the configured form blueprint and generate whole-page geometry candidates. An explicit VLM blueprint mismatch forces review rather than extraction against the wrong schema.
 7. Treat each useful layout block as a local association boundary. Optionally OCR the saved block crops in a bounded worker pool, restore their page coordinates, and merge only grounded candidates into the document state.
 8. Ask the local VLM for unresolved mappings and visual re-checking of every checkbox/radio group. The VLM must cite existing OCR plus actual-image evidence IDs.
-9. Normalize, validate, and score every field. Values below `0.90` receive bounded page/crop recovery.
+9. Normalize, validate, and score every field. Values below `0.90` are retried against their matching layout block; if neither evidence nor a printed label identifies one block, the configured bounded set of blocks is searched independently.
 10. Before review, re-check unresolved result paths against accumulated evidence and, when configured, the actual image through one more grounded VLM pass; then rescore.
 11. Accept a value only when it is grounded, valid, and above policy. Otherwise pause/queue it for review.
 12. Emit the requested `data`/`meta` JSON plus a local evidence and trace bundle.
@@ -216,6 +216,9 @@ evidence check:
 association:
   layout_blocks_enabled: true
   layout_block_ocr_enabled: true
+  layout_recovery_enabled: true
+  layout_recovery_search_all_blocks: true
+  whole_page_recovery_fallback: false
   layout_parallel_workers: 2
   layout_block_retries: 1
   max_layout_blocks: 24
@@ -233,6 +236,15 @@ thread-safe. Set it to `1` on a memory-constrained Mac; values above `1` trade
 additional model memory for lower block-recognition latency. A failure is retried
 per block according to `layout_block_retries`, and one failed block does not abort
 the document.
+
+Field recovery is layout-first. A recovery plan selects the smallest block that
+contains its cited evidence, then falls back to a block containing one of the
+configured printed-label aliases. If both were missed,
+`layout_recovery_search_all_blocks: true` retries the eligible blocks separately
+and combines their candidates after recognition. This search remains bounded by
+`max_layout_blocks` and `layout_parallel_workers`. Whole-page field recovery is
+disabled by default; enable `whole_page_recovery_fallback` only when that explicit
+fallback is wanted. Set `layout_recovery_enabled: false` to disable layout recovery.
 
 The evidence re-verification stage targets only unresolved paths and is bounded by
 `max_evidence_retries`. It can add candidates, but it cannot write directly to
@@ -285,13 +297,15 @@ Each run writes under `artifacts/<job-id>/`:
 result.json
 trace.jsonl
 evidence.json
+layout-extractions.json
 images/
   original-reference.json
   document-candidate-*.png
   layout-detected-*.png
   layout-blocks/
     layout-block-*.png
-  crop-*.png
+  layout-recovery/
+    layout-recovery-*.png
 document-understanding.json  # when the VLM analysis succeeds
 ```
 
@@ -307,6 +321,15 @@ When block OCR is enabled, each selected block crop is retained under
 `images/layout-blocks/`. Its hash, page bbox, recognition status, retry count,
 and resulting span IDs are recorded in `layoutBlockOCR`. Final evidence checks
 are recorded in `evidenceReverifications`.
+
+`layout-extractions.json` is the layout-level extraction log. Every entry records
+the block bbox and crop, actual OCR spans and controls, target paths, mapped
+candidates, retry count, status, and warnings. Its final `combined` object records
+the assembled `data`, accepted paths, unresolved paths, and field decisions. The
+same records are indexed from `evidence.json`, and the public result links the log
+through `meta.processors.layoutManifest`. Because it contains OCR text and field
+values, protect it with the same retention and encryption policy as
+`evidence.json`.
 
 Full-page enhancement is deliberately non-generative. Qwen can recommend only
 `deskew`, `local_contrast`, `illumination_normalization`,

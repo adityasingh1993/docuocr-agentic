@@ -314,6 +314,29 @@ class FieldCandidate(StrictModel):
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+class LayoutExtractionRecord(StrictModel):
+    id: str
+    stage: Literal["mapping", "recovery"]
+    block_id: str
+    block_label: str
+    block_source: str
+    page: int = Field(default=1, ge=1)
+    bbox: BBox
+    crop_path: str | None = None
+    target_paths: list[str] = Field(default_factory=list)
+    unresolved_target_paths: list[str] = Field(default_factory=list)
+    ocr_span_ids: list[str] = Field(default_factory=list)
+    ocr_spans: list[OCRSpan] = Field(default_factory=list)
+    control_ids: list[str] = Field(default_factory=list)
+    controls: list[FormControl] = Field(default_factory=list)
+    candidates: list[FieldCandidate] = Field(default_factory=list)
+    recognition_attempts: int = Field(default=0, ge=0)
+    status: Literal["succeeded", "partial", "failed", "skipped"]
+    warnings: list[str] = Field(default_factory=list)
+    model_id: str
+    attempt: int = Field(default=0, ge=0)
+
+
 class ConfidenceFeatures(StrictModel):
     image_quality: float = Field(ge=0.0, le=1.0)
     recognition: float = Field(ge=0.0, le=1.0)

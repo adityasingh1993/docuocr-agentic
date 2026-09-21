@@ -115,6 +115,14 @@ class GraphIntegrationTests(unittest.TestCase):
             self.assertIn("qualityHistory", evidence)
             self.assertIn("enhancementEvaluations", evidence)
             self.assertEqual(evidence["layoutBlockOCR"], [])
+            self.assertEqual(len(evidence["layoutExtractions"]), 1)
+            layout_record = evidence["layoutExtractions"][0]
+            self.assertEqual(layout_record["block_id"], "layout:p1:0000")
+            self.assertEqual(
+                layout_record["candidates"][0]["normalized_value"], "Amina"
+            )
+            self.assertTrue(layout_record["ocr_spans"])
+            self.assertEqual(layout_record["unresolved_target_paths"], [])
             self.assertEqual(evidence["evidenceReverifications"], [])
             self.assertEqual(len(evidence["layoutVisualizations"]), 1)
             visualization = evidence["layoutVisualizations"][0]
@@ -138,6 +146,22 @@ class GraphIntegrationTests(unittest.TestCase):
             }
             self.assertIn("document_understand", trace_nodes)
             self.assertIn("layout_block_map", trace_nodes)
+            layout_manifest_path = Path(
+                result["meta"]["processors"]["layoutManifest"]
+            )
+            self.assertTrue(layout_manifest_path.is_file())
+            layout_manifest = json.loads(
+                layout_manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(layout_manifest["layouts"]), 1)
+            self.assertEqual(
+                layout_manifest["combined"]["data"]["baby"]["firstName"],
+                "Amina",
+            )
+            self.assertEqual(
+                layout_manifest["combined"]["acceptedPaths"],
+                ["data.baby.firstName"],
+            )
 
     def test_unresolved_result_gets_one_bounded_evidence_pass(self) -> None:
         if importlib.util.find_spec("langgraph") is None:

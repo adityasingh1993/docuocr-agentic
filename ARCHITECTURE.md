@@ -29,7 +29,7 @@ flowchart TD
     C -->|"ready"| E["Global + block-local mapping"]
     D -->|"no safe gain"| E
     E --> F["Grounded VLM + scoring"]
-    F -->|"retry"| G["Targeted recovery"]
+    F -->|"retry"| G["Parallel layout recovery"]
     G --> F
     F -->|"still unresolved"| H["Evidence re-verification"]
     H --> F
@@ -44,6 +44,13 @@ owns an isolated OCR pipeline. Crop-local boxes are translated back to page
 coordinates before they enter the evidence ledger. Blocks are processed
 independently, so a failed region is retried locally and then recorded as failed
 without discarding successful regions.
+
+Field retries use those same layout boundaries. Cited evidence selects the
+smallest containing block; when evidence is absent, printed-label aliases select
+the block. If neither is available, configuration can search every eligible block
+independently. OCR is parallelized with the same bounded worker pool, candidates
+are merged only after all selected blocks finish, and full-page recovery is an
+explicit opt-in fallback rather than the first retry.
 
 ## 3. Bounded self-resolution
 
@@ -67,6 +74,11 @@ full-page repair, the workflow creates at most three variants and selects one
 only when OCR readiness improves while high-confidence baseline text and
 detected controls are retained. Adaptive binarization and checkbox-focused
 thresholding are limited to targeted recovery crops.
+
+Every mapping and recovery pass appends a layout-extraction record containing the
+crop, raw OCR spans, controls, candidate values, target paths, status, and warnings.
+Assembly writes these records in layout order and then appends the final combined
+data and field decisions to `layout-extractions.json`.
 
 If fields remain unresolved after recovery, the final evidence pass targets only
 those paths. Deterministic mapping is rerun over the accumulated page and
@@ -167,6 +179,7 @@ The public result has exactly two top-level keys: `data` and `meta`.
 - `meta.pre` contains raw pre-normalization values for the requested subset.
 - `meta.processors.steps` contains stage confidence, timings, model identifiers, decisions, warnings, and evidence references.
 - `meta.processors.fields` contains per-field score, disposition, attempts, and evidence references.
+- `meta.processors.layoutManifest` links the per-layout extraction log and its final combined result.
 - `meta.timing` contains the requested aggregate timings plus a per-step map.
 
 The Pydantic contract serializes camelCase names such as `dateOfBirth`, `birthTime`, and `createDocumentBlueprint` while the Python implementation uses snake_case internally.
@@ -196,6 +209,10 @@ Block-local OCR crops are separate extraction inputs and are retained with their
 hashes, global page boxes, model ID, retry count, status, error (when any), and
 recognized span IDs. Evidence re-verification attempts record their target paths
 and the rule/VLM candidates they produced.
+
+`layout-extractions.json` additionally keeps each block's OCR spans, controls,
+mapped candidates, and warnings, followed by the final combined data and field
+decisions. It contains document values and must be protected like `evidence.json`.
 
 ## 9. Runtime profiles
 
