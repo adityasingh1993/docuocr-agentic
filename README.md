@@ -14,12 +14,13 @@ The repository is deliberately **bounded-agentic**. LangGraph can retry approved
    - detect checkbox/radio controls with OpenCV.
 4. Ask Qwen3-VL once for bounded document understanding: form/card family match, languages, regions, control groups, quality issues, and handwriting legibility. It never returns field values in this pass.
 5. When readiness is low, generate up to three approved OpenCV variants. Keep the original unless a fresh OCR pass shows a configured gain while retaining baseline text and controls; then reacquire evidence from the selected image.
-6. Resolve the configured form blueprint and generate geometry-based field candidates. An explicit VLM blueprint mismatch forces review rather than extraction against the wrong schema.
-7. Ask the local VLM for unresolved mappings and visual re-checking of every checkbox/radio group. The VLM must cite existing OCR plus actual-image evidence IDs.
-8. Normalize and validate values with Pydantic and cross-field rules.
-9. Score every field. Values below `0.90` receive targeted crop enhancement and independent re-verification.
-10. Accept a value only when it is grounded, valid, and above policy. Otherwise pause/queue it for review.
-11. Emit the requested `data`/`meta` JSON plus a local evidence and trace bundle.
+6. Resolve the configured form blueprint and generate whole-page geometry candidates. An explicit VLM blueprint mismatch forces review rather than extraction against the wrong schema.
+7. Treat each useful layout block as a local association boundary. Optionally OCR the saved block crops in a bounded worker pool, restore their page coordinates, and merge only grounded candidates into the document state.
+8. Ask the local VLM for unresolved mappings and visual re-checking of every checkbox/radio group. The VLM must cite existing OCR plus actual-image evidence IDs.
+9. Normalize, validate, and score every field. Values below `0.90` receive bounded page/crop recovery.
+10. Before review, re-check unresolved result paths against accumulated evidence and, when configured, the actual image through one more grounded VLM pass; then rescore.
+11. Accept a value only when it is grounded, valid, and above policy. Otherwise pause/queue it for review.
+12. Emit the requested `data`/`meta` JSON plus a local evidence and trace bundle.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed design and scaling path.
 
@@ -201,6 +202,44 @@ raw OCR text remains the evidence. For a control such as `M`/`F`, the characters
 are option labels. Selection comes from visible ink—circle, tick, cross, or fill—
 in the actual image, not from OCR merely recognizing the option text.
 
+For forms that print one combined label such as `RN` beside a full name, a field
+may define `group_aliases` plus `group_value_part`. The included blueprint maps the
+first literal token to `firstName` and the remaining literal tokens to `lastName`.
+This is configurable per form family; it does not translate or invent name parts.
+
+### Layout-local association and final evidence pass
+
+The `association` section controls block-local recognition and the last bounded
+evidence check:
+
+```yaml
+association:
+  layout_blocks_enabled: true
+  layout_block_ocr_enabled: true
+  layout_parallel_workers: 2
+  layout_block_retries: 1
+  max_layout_blocks: 24
+  crop_padding_pixels: 12
+  min_block_area_fraction: 0.001
+  excluded_layout_labels: [image, header_image, figure, seal, stamp]
+  evidence_reverify_enabled: true
+  max_evidence_retries: 1
+  reverify_with_vlm: true
+```
+
+`layout_parallel_workers` is a hard upper bound. Each Paddle worker owns an
+isolated recognizer because a shared in-process pipeline is not assumed to be
+thread-safe. Set it to `1` on a memory-constrained Mac; values above `1` trade
+additional model memory for lower block-recognition latency. A failure is retried
+per block according to `layout_block_retries`, and one failed block does not abort
+the document.
+
+The evidence re-verification stage targets only unresolved paths and is bounded by
+`max_evidence_retries`. It can add candidates, but it cannot write directly to
+`data`: candidates must still pass grounding, deterministic validation, and the
+normal confidence policy on the following score pass. Set
+`reverify_with_vlm: false` to keep this pass deterministic and OCR-only.
+
 ## Run
 
 With installed local backends, pass the actual image as the positional argument and
@@ -250,6 +289,8 @@ images/
   original-reference.json
   document-candidate-*.png
   layout-detected-*.png
+  layout-blocks/
+    layout-block-*.png
   crop-*.png
 document-understanding.json  # when the VLM analysis succeeds
 ```
@@ -261,6 +302,11 @@ an overlay of detected boxes, class labels, and confidence scores on the exact
 active image used for that pass. Extracted text is not drawn on the overlay. The
 source/output hashes and block counts are recorded in `layoutVisualizations` in
 `evidence.json`. Set `trace.save_layout_images: false` to disable these images.
+
+When block OCR is enabled, each selected block crop is retained under
+`images/layout-blocks/`. Its hash, page bbox, recognition status, retry count,
+and resulting span IDs are recorded in `layoutBlockOCR`. Final evidence checks
+are recorded in `evidenceReverifications`.
 
 Full-page enhancement is deliberately non-generative. Qwen can recommend only
 `deskew`, `local_contrast`, `illumination_normalization`,

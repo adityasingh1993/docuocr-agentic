@@ -27,6 +27,11 @@ from docuocr.engines.vlm import LocalVLMClient
 from docuocr.extraction.blueprint import DocumentBlueprint
 from docuocr.extraction.confidence import ConfidenceScorer
 from docuocr.extraction.grounding import GroundingError, GroundingVerifier
+from docuocr.extraction.layout_processing import (
+    LayoutBlockProcessor,
+    controls_in_region,
+    spans_in_region,
+)
 from docuocr.extraction.rules import associate_controls, map_rule_candidates
 from docuocr.extraction.validation import validate_candidates
 from docuocr.models import (
@@ -35,6 +40,7 @@ from docuocr.models import (
     EnhancementEvaluation,
     EvidenceKind,
     EvidenceRecord,
+    EvidenceReverificationRecord,
     FieldCandidate,
     FieldDecision,
     FormControl,
@@ -69,6 +75,7 @@ class WorkflowNodes:
         self.quality_assessor = ImageQualityAssessor()
         self.enhancer = ImageEnhancer()
         self.layout_visualizer = LayoutVisualizer()
+        self.layout_block_processor = LayoutBlockProcessor(text_engine)
         self.scorer = ConfidenceScorer(settings.policy.accept_threshold)
         self.grounding = GroundingVerifier()
 
@@ -98,6 +105,7 @@ class WorkflowNodes:
                 "document_attempt": 0,
                 "document_understanding_attempted": False,
                 "field_attempt": 0,
+                "evidence_reverification_attempt": 0,
                 "errors": [],
                 "warnings": [],
                 "timings": {},
@@ -506,6 +514,91 @@ class WorkflowNodes:
             model_id=f"blueprint:{self.blueprint.id}",
         )
 
+    def layout_block_map(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
+
+        def work() -> dict[str, Any]:
+            existing = _models(FieldCandidate, state.get("candidates", []))
+            if not self.settings.association.layout_blocks_enabled:
+                return {
+                    "candidates": [item.model_dump(mode="json") for item in existing],
+                    "_decision": "disabled",
+                }
+            blocks = _models(LayoutBlock, state.get("layout_blocks", []))
+            if not blocks:
+                return {
+                    "candidates": [item.model_dump(mode="json") for item in existing],
+                    "_stage_confidence": 0.0,
+                    "_decision": "no_layout_blocks",
+                }
+
+            baseline_spans = _models(OCRSpan, state.get("ocr_spans", []))
+            controls = _models(FormControl, state.get("controls", []))
+            processed, warnings = self.layout_block_processor.process(
+                image_path=state["active_image_path"],
+                run_dir=state["run_dir"],
+                blocks=blocks,
+                settings=self.settings.association,
+                attempt=attempt,
+            )
+            recognized_spans = [
+                span for item in processed for span in item.recognized_spans
+            ]
+            local_candidates: list[FieldCandidate] = []
+            for item in processed:
+                block_spans = _unique_models_by_id(
+                    [
+                        *spans_in_region(baseline_spans, item.block),
+                        *item.recognized_spans,
+                    ]
+                )
+                block_controls = controls_in_region(controls, item.block)
+                local_candidates.extend(
+                    map_rule_candidates(
+                        self.blueprint,
+                        block_spans,
+                        block_controls,
+                        attempt=attempt,
+                    )
+                )
+
+            combined_spans = _unique_models_by_id(
+                [*baseline_spans, *recognized_spans]
+            )
+            merged = _merge_candidates([*existing, *local_candidates])
+            records = [
+                item.record.model_dump(mode="json")
+                for item in processed
+                if item.record is not None
+            ]
+            evidence = [_ocr_evidence(item) for item in recognized_spans]
+            covered = {
+                item.path for item in merged if item.normalized_value is not None
+            }
+            return {
+                "ocr_spans": [
+                    item.model_dump(mode="json") for item in combined_spans
+                ],
+                "ocr_ledger": [
+                    item.model_dump(mode="json") for item in recognized_spans
+                ],
+                "layout_block_ocr": records,
+                "evidence": [item.model_dump(mode="json") for item in evidence],
+                "candidates": [item.model_dump(mode="json") for item in merged],
+                "warnings": warnings,
+                "_stage_confidence": len(covered)
+                / max(1, len(self.blueprint.output_paths)),
+                "_decision": f"processed:{len(processed)}",
+            }
+
+        return self._execute(
+            "layout_block_map",
+            state,
+            attempt,
+            work,
+            model_id=f"{self.text_engine.model_id}+layout-association-v1",
+        )
+
     def vlm_map(self, state: DocumentState) -> dict[str, Any]:
         document_attempt = state.get("document_attempt", 0)
 
@@ -637,6 +730,121 @@ class WorkflowNodes:
 
         return self._execute(
             "score", state, attempt, work, model_id="confidence-policy-v1"
+        )
+
+    def evidence_reverify(self, state: DocumentState) -> dict[str, Any]:
+        verification_attempt = state.get("evidence_reverification_attempt", 0) + 1
+
+        def work() -> dict[str, Any]:
+            target_paths = [
+                path
+                for path, payload in state.get("decisions", {}).items()
+                if payload.get("disposition") != "accepted"
+            ]
+            existing = _models(FieldCandidate, state.get("candidates", []))
+            if not target_paths:
+                return {
+                    "evidence_reverification_attempt": verification_attempt,
+                    "field_attempt": state.get("field_attempt", 0) + 1,
+                    "candidates": [
+                        item.model_dump(mode="json") for item in existing
+                    ],
+                    "_stage_confidence": 1.0,
+                    "_decision": "nothing_to_reverify",
+                }
+
+            spans = _models(OCRSpan, state.get("ocr_spans", []))
+            controls = associate_controls(
+                _models(FormControl, state.get("controls", [])), spans
+            )
+            blocks = _models(LayoutBlock, state.get("layout_blocks", []))
+            rule_additions = map_rule_candidates(
+                self.blueprint,
+                spans,
+                controls,
+                attempt=state.get("field_attempt", 0) + 1,
+                only_paths=set(target_paths),
+            )
+            evidence = _models(EvidenceRecord, state.get("evidence", []))
+            new_evidence: list[EvidenceRecord] = []
+            vlm_additions: list[FieldCandidate] = []
+            warnings: list[str] = []
+            if (
+                self.vlm is not None
+                and self.settings.association.reverify_with_vlm
+            ):
+                quality = QualityReport.model_validate(state["quality"])
+                active_image = Path(state["active_image_path"])
+                image_evidence = EvidenceRecord(
+                    id=f"image:reverify{verification_attempt}:p1:active",
+                    kind=EvidenceKind.IMAGE,
+                    bbox=BBox(x1=0, y1=0, x2=quality.width, y2=quality.height),
+                    confidence=_effective_quality(quality),
+                    source="document_image",
+                    artifact_path=str(active_image),
+                    artifact_sha256=sha256_file(active_image),
+                    transform_chain=["evidence_reverification"],
+                )
+                evidence.append(image_evidence)
+                new_evidence.append(image_evidence)
+                vlm_additions, vlm_warnings = self._vlm_candidates(
+                    image_path=active_image,
+                    target_paths=target_paths,
+                    spans=spans,
+                    blocks=blocks,
+                    controls=controls,
+                    evidence=evidence,
+                    attempt=state.get("field_attempt", 0) + 1,
+                    visual_verification=True,
+                    image_evidence_id=image_evidence.id,
+                    document_context=_document_understanding(state),
+                )
+                warnings.extend(vlm_warnings)
+
+            merged, reconciliation_warnings = _reconcile_visual_controls(
+                _merge_candidates(
+                    [*existing, *rule_additions, *vlm_additions]
+                ),
+                self.blueprint.checkbox_paths,
+            )
+            warnings.extend(reconciliation_warnings)
+            added_paths = sorted(
+                {
+                    item.path
+                    for item in [*rule_additions, *vlm_additions]
+                    if item.normalized_value is not None
+                }
+            )
+            record = EvidenceReverificationRecord(
+                attempt=verification_attempt,
+                target_paths=target_paths,
+                rule_candidate_count=len(rule_additions),
+                vlm_candidate_count=len(vlm_additions),
+                candidate_paths=added_paths,
+            )
+            return {
+                "field_attempt": state.get("field_attempt", 0) + 1,
+                "evidence_reverification_attempt": verification_attempt,
+                "evidence_reverifications": [record.model_dump(mode="json")],
+                "controls": [item.model_dump(mode="json") for item in controls],
+                "candidates": [item.model_dump(mode="json") for item in merged],
+                "evidence": [
+                    item.model_dump(mode="json") for item in new_evidence
+                ],
+                "warnings": warnings,
+                "_stage_confidence": len(added_paths) / max(1, len(target_paths)),
+                "_decision": "rescore_evidence",
+            }
+
+        model_id = "evidence-rules-v1"
+        if self.vlm is not None and self.settings.association.reverify_with_vlm:
+            model_id = f"evidence-rules+{self.vlm.model_id}"
+        return self._execute(
+            "evidence_reverify",
+            state,
+            verification_attempt,
+            work,
+            model_id=model_id,
         )
 
     def recover(self, state: DocumentState) -> dict[str, Any]:
@@ -787,6 +995,10 @@ class WorkflowNodes:
                         "layoutBlocks": state.get("layout_ledger", []),
                         "layoutVisualizations": state.get(
                             "layout_visualizations", []
+                        ),
+                        "layoutBlockOCR": state.get("layout_block_ocr", []),
+                        "evidenceReverifications": state.get(
+                            "evidence_reverifications", []
                         ),
                         "controls": state.get("control_ledger", []),
                     },
@@ -1247,6 +1459,31 @@ def _control_evidence(item: FormControl) -> EvidenceRecord:
 
 def _models(model: Any, values: list[dict[str, Any]]) -> list[Any]:
     return [model.model_validate(value) for value in values]
+
+
+def _unique_models_by_id(values: list[Any]) -> list[Any]:
+    result: dict[str, Any] = {}
+    for item in values:
+        result.setdefault(item.id, item)
+    return list(result.values())
+
+
+def _merge_candidates(candidates: list[FieldCandidate]) -> list[FieldCandidate]:
+    result: dict[tuple[str, str, str, tuple[str, ...]], FieldCandidate] = {}
+    for candidate in candidates:
+        key = (
+            candidate.path,
+            candidate.value_fingerprint(),
+            candidate.source,
+            tuple(candidate.evidence_ids),
+        )
+        previous = result.get(key)
+        if previous is None or (
+            candidate.recognition_confidence * candidate.association_confidence
+            > previous.recognition_confidence * previous.association_confidence
+        ):
+            result[key] = candidate
+    return list(result.values())
 
 
 def _document_understanding(state: DocumentState) -> DocumentUnderstanding | None:

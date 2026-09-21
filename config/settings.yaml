@@ -48,3 +48,16 @@ trace:
   include_values: false
   save_crops: true
   save_layout_images: true
+
+association:
+  layout_blocks_enabled: true
+  layout_block_ocr_enabled: true
+  layout_parallel_workers: 2
+  layout_block_retries: 1
+  max_layout_blocks: 24
+  crop_padding_pixels: 12
+  min_block_area_fraction: 0.001
+  excluded_layout_labels: [image, header_image, figure, seal, stamp]
+  evidence_reverify_enabled: true
+  max_evidence_retries: 1
+  reverify_with_vlm: true

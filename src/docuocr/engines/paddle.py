@@ -63,11 +63,17 @@ class PaddleTextEngine:
     """Lazy adapter for PaddleOCR 3.x general OCR results."""
 
     model_id = "paddleocr-general"
+    supports_region_ocr = True
 
     def __init__(self, settings: PaddleSettings) -> None:
         self.settings = settings
         self.engine = settings.resolved_text_engine
         self._pipeline: Any = None
+
+    def fork(self) -> PaddleTextEngine:
+        """Create an isolated lazy pipeline for a layout OCR worker."""
+
+        return PaddleTextEngine(self.settings)
 
     def _get_pipeline(self) -> Any:
         if self._pipeline is None:

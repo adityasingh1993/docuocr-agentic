@@ -11,10 +11,14 @@ class SidecarBundle:
     """Deterministic evidence adapter for tests, integration, and engine isolation."""
 
     model_id = "sidecar-evidence-v1"
+    supports_region_ocr = False
 
     def __init__(self, path: str | Path) -> None:
         with Path(path).open("r", encoding="utf-8") as stream:
             self.payload: dict[str, Any] = json.load(stream)
+
+    def fork(self) -> SidecarBundle:
+        return self
 
     def extract(
         self,
@@ -77,6 +81,10 @@ class SidecarBundle:
 
 class NullTextEngine:
     model_id = "disabled"
+    supports_region_ocr = False
+
+    def fork(self) -> NullTextEngine:
+        return self
 
     def extract(self, image_path: str | Path, **_: Any) -> list[OCRSpan]:
         return []

@@ -81,6 +81,20 @@ class LayoutVisualizationRecord(StrictModel):
     attempt: int = Field(default=0, ge=0)
 
 
+class LayoutBlockOCRRecord(StrictModel):
+    block_id: str
+    label: str
+    bbox: BBox
+    crop_path: str
+    crop_sha256: str
+    span_ids: list[str] = Field(default_factory=list)
+    recognition_attempts: int = Field(ge=1)
+    status: Literal["succeeded", "failed"]
+    error: str | None = None
+    model_id: str
+    attempt: int = Field(default=0, ge=0)
+
+
 class ControlKind(StrEnum):
     CHECKBOX = "checkbox"
     RADIO = "radio"
@@ -319,6 +333,14 @@ class FieldDecision(StrictModel):
     disposition: Literal["accepted", "retry", "review", "missing"]
     features: ConfidenceFeatures | None = None
     reasons: list[str] = Field(default_factory=list)
+
+
+class EvidenceReverificationRecord(StrictModel):
+    attempt: int = Field(ge=1)
+    target_paths: list[str]
+    rule_candidate_count: int = Field(ge=0)
+    vlm_candidate_count: int = Field(ge=0)
+    candidate_paths: list[str]
 
 
 class RecoveryAction(StrEnum):

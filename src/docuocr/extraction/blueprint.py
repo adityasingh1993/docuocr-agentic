@@ -21,6 +21,8 @@ class FieldSpec(BlueprintModel):
     critical: bool = False
     required: bool = False
     pattern: str | None = None
+    group_aliases: list[str] = Field(default_factory=list)
+    group_value_part: Literal["whole", "first_token", "remaining_tokens"] = "whole"
 
 
 class CheckboxOption(BlueprintModel):
@@ -101,6 +103,8 @@ class DocumentBlueprint(BlueprintModel):
                 "kind": "printed_label_value",
                 "valueType": spec.type,
                 "printedLabelAliases": spec.aliases,
+                "groupLabelAliases": spec.group_aliases,
+                "valuePart": spec.group_value_part,
             }
         for group_name, group in self.checkbox_groups.items():
             for option_name, option in group.options.items():

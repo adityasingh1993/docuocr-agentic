@@ -82,6 +82,38 @@ class RuleMappingTests(unittest.TestCase):
         self.assertEqual(weight.raw_value, "3735")
         self.assertEqual(weight.normalized_value, "3.735 kg")
 
+    def test_group_label_splits_full_name_into_configured_literal_parts(self) -> None:
+        spans = [
+            OCRSpan(
+                id="ocr:p1:label",
+                text="RN:",
+                confidence=0.99,
+                bbox=BBox(x1=10, y1=10, x2=55, y2=35),
+            ),
+            OCRSpan(
+                id="ocr:p1:value",
+                text="Maria Joao da Silva",
+                confidence=0.97,
+                bbox=BBox(x1=70, y1=10, x2=260, y2=35),
+            ),
+        ]
+
+        candidates = map_rule_candidates(self.blueprint, spans, [])
+        by_path = {
+            item.path: item
+            for item in candidates
+            if item.source == "rule_group_right_of_label"
+        }
+
+        self.assertEqual(by_path["data.baby.firstName"].raw_value, "Maria")
+        self.assertEqual(
+            by_path["data.baby.lastName"].raw_value, "Joao da Silva"
+        )
+        self.assertEqual(
+            by_path["data.baby.firstName"].evidence_ids,
+            ["ocr:p1:label", "ocr:p1:value"],
+        )
+
     def test_grounded_visual_control_overrides_conflicting_contour_guess(self) -> None:
         opencv = FieldCandidate(
             path="data.baby.male",

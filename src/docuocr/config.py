@@ -108,6 +108,22 @@ class TraceSettings(SettingsModel):
     save_layout_images: bool = True
 
 
+class AssociationSettings(SettingsModel):
+    layout_blocks_enabled: bool = True
+    layout_block_ocr_enabled: bool = True
+    layout_parallel_workers: int = Field(default=2, ge=1, le=8)
+    layout_block_retries: int = Field(default=1, ge=0, le=3)
+    max_layout_blocks: int = Field(default=24, ge=1, le=100)
+    crop_padding_pixels: int = Field(default=12, ge=0, le=256)
+    min_block_area_fraction: float = Field(default=0.001, ge=0.0, le=0.25)
+    excluded_layout_labels: list[str] = Field(
+        default_factory=lambda: ["image", "header_image", "figure", "seal", "stamp"]
+    )
+    evidence_reverify_enabled: bool = True
+    max_evidence_retries: int = Field(default=1, ge=0, le=2)
+    reverify_with_vlm: bool = True
+
+
 class AppSettings(SettingsModel):
     schema_version: str = "1.0"
     artifact_root: str = "artifacts"
@@ -116,6 +132,7 @@ class AppSettings(SettingsModel):
     paddle: PaddleSettings = Field(default_factory=PaddleSettings)
     vlm: VLMSettings = Field(default_factory=VLMSettings)
     trace: TraceSettings = Field(default_factory=TraceSettings)
+    association: AssociationSettings = Field(default_factory=AssociationSettings)
 
     @model_validator(mode="after")
     def enforce_offline_model_paths(self) -> AppSettings:

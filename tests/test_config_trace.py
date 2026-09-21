@@ -60,6 +60,20 @@ class ConfigAndTraceTests(unittest.TestCase):
         )
         self.assertFalse(settings.trace.save_layout_images)
 
+    def test_layout_association_parallelism_and_retries_are_configurable(self) -> None:
+        settings = AppSettings.model_validate(
+            {
+                "association": {
+                    "layout_parallel_workers": 3,
+                    "layout_block_retries": 2,
+                    "max_evidence_retries": 2,
+                }
+            }
+        )
+        self.assertEqual(settings.association.layout_parallel_workers, 3)
+        self.assertEqual(settings.association.layout_block_retries, 2)
+        self.assertEqual(settings.association.max_evidence_retries, 2)
+
     def test_trace_append_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"

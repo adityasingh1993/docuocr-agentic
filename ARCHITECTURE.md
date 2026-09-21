@@ -26,14 +26,24 @@ flowchart TD
     B --> C["Qwen structure + legibility"]
     C -->|"readiness low"| D["Bounded OpenCV candidates"]
     D -->|"measured OCR gain"| B
-    C -->|"ready"| E["Grounded mapping + validation"]
+    C -->|"ready"| E["Global + block-local mapping"]
     D -->|"no safe gain"| E
-    E -->|"accepted"| F["Assemble result"]
-    E -->|"unresolved"| G["Targeted recovery or review"]
+    E --> F["Grounded VLM + scoring"]
+    F -->|"retry"| G["Targeted recovery"]
     G --> F
+    F -->|"still unresolved"| H["Evidence re-verification"]
+    H --> F
+    F -->|"accepted or review"| I["Assemble result"]
 ```
 
 Parallel evidence acquisition consists of layout parsing, exhaustive OCR, and form-control detection. A join node waits for all three before document understanding and field mapping. Qwen receives the actual image, but its first call returns only bounded structural and quality metadata—not extracted values.
+
+After the join, selected layout regions become local association boundaries.
+Their crops are recognized with a configurable, bounded thread pool; each worker
+owns an isolated OCR pipeline. Crop-local boxes are translated back to page
+coordinates before they enter the evidence ledger. Blocks are processed
+independently, so a failed region is retried locally and then recorded as failed
+without discarding successful regions.
 
 ## 3. Bounded self-resolution
 
@@ -49,7 +59,20 @@ The recovery planner chooses only from an enum of approved, deterministic action
 | ambiguous checkbox | border suppression + binary variants | consensus of fill classifiers |
 | glare/occlusion | no destructive repair | human review |
 
-The graph has a document-quality retry limit and a field-recovery retry limit. It never recursively asks the model to “try something else.” Qwen may choose only from a fixed profile enum and cannot provide transform parameters. For a full-page repair, the workflow creates at most three variants and selects one only when OCR readiness improves while high-confidence baseline text and detected controls are retained. Adaptive binarization and checkbox-focused thresholding are limited to targeted recovery crops.
+The graph has a document-quality retry limit, a field-recovery retry limit, a
+per-layout-block OCR retry limit, and a final evidence re-verification limit. It
+never recursively asks the model to “try something else.” Qwen may choose only
+from a fixed profile enum and cannot provide transform parameters. For a
+full-page repair, the workflow creates at most three variants and selects one
+only when OCR readiness improves while high-confidence baseline text and
+detected controls are retained. Adaptive binarization and checkbox-focused
+thresholding are limited to targeted recovery crops.
+
+If fields remain unresolved after recovery, the final evidence pass targets only
+those paths. Deterministic mapping is rerun over the accumulated page and
+block-level evidence, and an optional VLM call re-examines the actual image. The
+result is scored again through the same grounding, validation, and confidence
+policy. A blueprint mismatch skips re-verification and goes directly to review.
 
 Document readiness combines observable technical quality, OCR readiness, and a categorical semantic factor. Qwen reports handwriting as `not_present`, `good`, `fair`, `poor`, or `unreadable`; deterministic code maps that category to an uncalibrated quality component. The original image remains immutable and is retained whenever no candidate demonstrates a measurable gain.
 
@@ -107,6 +130,7 @@ Forms are handled with versioned blueprints rather than code branches. A bluepri
 
 - document identifiers and anchor phrases;
 - multilingual aliases per canonical field;
+- optional group aliases and literal full-value splitting rules;
 - geometry strategies (`right_of_label`, `below_label`, checkbox group);
 - normalization and validation rules;
 - required/critical flags;
@@ -122,9 +146,11 @@ Resolution order:
 
 1. whole-image document understanding against the configured blueprint;
 2. known-template registration and ROIs when available;
-3. alias + geometry rules;
-4. layout-aware local VLM mapping with evidence IDs;
-5. review.
+3. whole-page alias + geometry rules;
+4. block-local OCR and association;
+5. grounded local VLM mapping with evidence IDs;
+6. bounded unresolved-evidence re-verification;
+7. review.
 
 The understanding pass can mark the configured blueprint as `match`, `possible`,
 `mismatch`, or `unknown`. An explicit mismatch prevents automatic acceptance and
@@ -166,13 +192,18 @@ labels, and confidence scores—not recognized text. Its source/output hashes an
 block counts are retained in `evidence.json`; the overlay never becomes an
 extraction input.
 
+Block-local OCR crops are separate extraction inputs and are retained with their
+hashes, global page boxes, model ID, retry count, status, error (when any), and
+recognized span IDs. Evidence re-verification attempts record their target paths
+and the rule/VLM candidates they produced.
+
 ## 9. Runtime profiles
 
 ### Developer workstation
 
 - SQLite LangGraph checkpointer;
 - local artifact directory;
-- one in-process worker;
+- configurable bounded in-process layout OCR workers;
 - Paddle adapters or sidecar/mock evidence.
 
 ### Production on-prem

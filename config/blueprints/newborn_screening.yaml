@@ -31,11 +31,15 @@ fields:
     type: string
     aliases: [baby first name, child first name, given name, first name, primeiro nome do bebê, primeiro nome do bebe, nome próprio, nome proprio]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    group_aliases: [rn, nome do rn, nome do recém-nascido, nome do recem-nascido]
+    group_value_part: first_token
     critical: true
   data.baby.lastName:
     type: string
     aliases: [baby last name, child last name, family name, surname, last name, sobrenome do bebê, sobrenome do bebe, sobrenome]
     strategies: [same_line, right_of_label, below_label, vlm_grounded]
+    group_aliases: [rn, nome do rn, nome do recém-nascido, nome do recem-nascido]
+    group_value_part: remaining_tokens
     critical: true
   data.baby.nationality:
     type: string

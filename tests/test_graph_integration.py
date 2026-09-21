@@ -114,6 +114,8 @@ class GraphIntegrationTests(unittest.TestCase):
             self.assertEqual(evidence["activeImagePath"], str(image_path.resolve()))
             self.assertIn("qualityHistory", evidence)
             self.assertIn("enhancementEvaluations", evidence)
+            self.assertEqual(evidence["layoutBlockOCR"], [])
+            self.assertEqual(evidence["evidenceReverifications"], [])
             self.assertEqual(len(evidence["layoutVisualizations"]), 1)
             visualization = evidence["layoutVisualizations"][0]
             self.assertEqual(visualization["block_count"], 1)
@@ -135,6 +137,85 @@ class GraphIntegrationTests(unittest.TestCase):
                 ).read_text(encoding="utf-8").splitlines()
             }
             self.assertIn("document_understand", trace_nodes)
+            self.assertIn("layout_block_map", trace_nodes)
+
+    def test_unresolved_result_gets_one_bounded_evidence_pass(self) -> None:
+        if importlib.util.find_spec("langgraph") is None:
+            self.skipTest("LangGraph is not installed")
+        try:
+            import cv2
+        except ImportError:
+            self.skipTest("OpenCV is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "blank.png"
+            image = np.full((200, 400, 3), 255, dtype=np.uint8)
+            self.assertTrue(cv2.imwrite(str(image_path), image))
+            sidecar_path = root / "evidence.json"
+            sidecar_path.write_text(
+                json.dumps(
+                    {"ocrSpans": [], "layoutBlocks": [], "controls": []}
+                ),
+                encoding="utf-8",
+            )
+            settings = AppSettings.model_validate(
+                {
+                    "artifact_root": str(root / "artifacts"),
+                    "policy": {
+                        "max_document_enhancements": 0,
+                        "max_field_retries": 0,
+                    },
+                    "association": {
+                        "layout_blocks_enabled": False,
+                        "max_evidence_retries": 1,
+                        "reverify_with_vlm": False,
+                    },
+                }
+            )
+            blueprint = DocumentBlueprint.model_validate(
+                {
+                    "id": "missing-only-v1",
+                    "version": "1",
+                    "document_type": "test",
+                    "fields": {
+                        "data.baby.firstName": {
+                            "type": "string",
+                            "aliases": ["first name"],
+                            "strategies": ["right_of_label"],
+                            "critical": True,
+                        }
+                    },
+                }
+            )
+            with DocumentPipeline(
+                settings=settings,
+                blueprint=blueprint,
+                sidecar_path=sidecar_path,
+            ) as pipeline:
+                result = pipeline.extract(image_path, job_id="reverify-route")
+
+            run_dir = root / "artifacts" / "reverify-route"
+            evidence = json.loads(
+                (run_dir / "evidence.json").read_text(encoding="utf-8")
+            )
+            trace = [
+                json.loads(line)
+                for line in (run_dir / "trace.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        field = result["meta"]["processors"]["fields"]["data.baby.firstName"]
+        self.assertEqual(field["disposition"], "review")
+        self.assertEqual(len(evidence["evidenceReverifications"]), 1)
+        self.assertEqual(
+            [
+                item["node"]
+                for item in trace
+                if item["node"] in {"score", "evidence_reverify", "review"}
+            ],
+            ["score", "evidence_reverify", "score", "review"],
+        )
 
 
 def _span(

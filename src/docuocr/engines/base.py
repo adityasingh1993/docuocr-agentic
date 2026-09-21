@@ -8,6 +8,9 @@ from docuocr.models import FormControl, LayoutBlock, OCRSpan
 
 class TextEngine(Protocol):
     model_id: str
+    supports_region_ocr: bool
+
+    def fork(self) -> TextEngine: ...
 
     def extract(
         self,

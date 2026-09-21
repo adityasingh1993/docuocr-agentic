@@ -23,6 +23,7 @@ class DocumentState(TypedDict, total=False):
     started_at: str
     document_attempt: int
     field_attempt: int
+    evidence_reverification_attempt: int
     quality: dict[str, Any]
     quality_history: Annotated[list[dict[str, Any]], operator.add]
     enhancements: Annotated[list[dict[str, Any]], operator.add]
@@ -33,6 +34,7 @@ class DocumentState(TypedDict, total=False):
     document_understanding_image_sha256: str
     layout_blocks: list[dict[str, Any]]
     layout_visualizations: Annotated[list[dict[str, Any]], operator.add]
+    layout_block_ocr: Annotated[list[dict[str, Any]], operator.add]
     ocr_spans: list[dict[str, Any]]
     controls: list[dict[str, Any]]
     layout_ledger: Annotated[list[dict[str, Any]], operator.add]
@@ -43,6 +45,7 @@ class DocumentState(TypedDict, total=False):
     decisions: dict[str, dict[str, Any]]
     unresolved_paths: list[str]
     recovery_plans: list[dict[str, Any]]
+    evidence_reverifications: Annotated[list[dict[str, Any]], operator.add]
     human_corrections: dict[str, Any]
     review_required: bool
     processor_steps: Annotated[list[dict[str, Any]], operator.add]

@@ -20,9 +20,11 @@ def build_graph(nodes: WorkflowNodes, *, checkpointer: Any = None) -> Any:
     builder.add_node("controls", nodes.controls)
     builder.add_node("document_understand", nodes.document_understand)
     builder.add_node("map_rules", nodes.map_rules)
+    builder.add_node("layout_block_map", nodes.layout_block_map)
     builder.add_node("vlm_map", nodes.vlm_map)
     builder.add_node("score", nodes.score)
     builder.add_node("recover", nodes.recover)
+    builder.add_node("evidence_reverify", nodes.evidence_reverify)
     builder.add_node("review", nodes.review)
     builder.add_node("assemble", nodes.assemble)
 
@@ -43,14 +45,21 @@ def build_graph(nodes: WorkflowNodes, *, checkpointer: Any = None) -> Any:
         _enhancement_route,
         {"reextract": "extraction_start", "map": "map_rules"},
     )
-    builder.add_edge("map_rules", "vlm_map")
+    builder.add_edge("map_rules", "layout_block_map")
+    builder.add_edge("layout_block_map", "vlm_map")
     builder.add_edge("vlm_map", "score")
     builder.add_conditional_edges(
         "score",
-        _score_route,
-        {"recover": "recover", "review": "review", "complete": "assemble"},
+        lambda state: _score_route(state, nodes),
+        {
+            "recover": "recover",
+            "reverify": "evidence_reverify",
+            "review": "review",
+            "complete": "assemble",
+        },
     )
     builder.add_edge("recover", "score")
+    builder.add_edge("evidence_reverify", "score")
     builder.add_edge("review", "assemble")
     builder.add_edge("assemble", END)
     return builder.compile(checkpointer=checkpointer)
@@ -79,12 +88,24 @@ def _enhancement_route(state: DocumentState) -> Literal["reextract", "map"]:
     return "map"
 
 
-def _score_route(state: DocumentState) -> Literal["recover", "review", "complete"]:
+def _score_route(
+    state: DocumentState, nodes: WorkflowNodes
+) -> Literal["recover", "reverify", "review", "complete"]:
     dispositions = {
         value.get("disposition") for value in state.get("decisions", {}).values()
     }
     if "retry" in dispositions:
         return "recover"
     if dispositions - {"accepted"}:
+        understanding = state.get("document_understanding") or {}
+        if understanding.get("schema_match") == "mismatch":
+            return "review"
+        settings = nodes.settings.association
+        if (
+            settings.evidence_reverify_enabled
+            and state.get("evidence_reverification_attempt", 0)
+            < settings.max_evidence_retries
+        ):
+            return "reverify"
         return "review"
     return "complete"

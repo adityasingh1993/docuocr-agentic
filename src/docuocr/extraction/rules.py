@@ -92,28 +92,90 @@ def _text_candidates(
     blueprint: DocumentBlueprint,
     attempt: int,
 ) -> list[FieldCandidate]:
+    found = _text_candidates_for_aliases(
+        path,
+        spec,
+        spans,
+        blueprint,
+        attempt,
+        aliases=spec.aliases,
+        value_part="whole",
+        match_threshold=0.78,
+        source_prefix="",
+    )
+    if spec.group_aliases:
+        found.extend(
+            _text_candidates_for_aliases(
+                path,
+                spec,
+                spans,
+                blueprint,
+                attempt,
+                aliases=spec.group_aliases,
+                value_part=spec.group_value_part,
+                match_threshold=0.90,
+                source_prefix="group_",
+                group_aliases=True,
+            )
+        )
+    deduped: dict[tuple[str, str, tuple[str, ...]], FieldCandidate] = {}
+    for candidate in found:
+        key = (
+            candidate.source,
+            candidate.value_fingerprint(),
+            tuple(candidate.evidence_ids),
+        )
+        previous = deduped.get(key)
+        if previous is None or (
+            candidate.recognition_confidence * candidate.association_confidence
+            > previous.recognition_confidence * previous.association_confidence
+        ):
+            deduped[key] = candidate
+    return list(deduped.values())
+
+
+def _text_candidates_for_aliases(
+    path: str,
+    spec: FieldSpec,
+    spans: list[OCRSpan],
+    blueprint: DocumentBlueprint,
+    attempt: int,
+    *,
+    aliases: Iterable[str],
+    value_part: str,
+    match_threshold: float,
+    source_prefix: str,
+    group_aliases: bool = False,
+) -> list[FieldCandidate]:
+    aliases = list(aliases)
     found: list[FieldCandidate] = []
     for label in spans:
-        match = alias_score(label.text, spec.aliases)
-        if match < 0.78:
+        match = (
+            _group_alias_score(label.text, aliases)
+            if group_aliases
+            else alias_score(label.text, aliases)
+        )
+        if match < match_threshold:
             continue
-        same_line = _same_line_suffix(label.text, spec.aliases)
+        same_line = _same_line_suffix(label.text, aliases)
         if same_line and "same_line" in spec.strategies:
-            normalized = normalize_value(same_line, spec, blueprint.normalization)
-            found.append(
-                FieldCandidate(
-                    path=path,
-                    raw_value=same_line,
-                    normalized_value=normalized.value,
-                    evidence_ids=[label.id],
-                    source="rule_same_line",
-                    support_sources=[label.source],
-                    recognition_confidence=label.confidence,
-                    association_confidence=match,
-                    attempt=attempt,
-                    validation_codes=normalized.codes,
+            selected = _select_value_part(same_line, value_part)
+            if selected is not None:
+                normalized = normalize_value(selected, spec, blueprint.normalization)
+                found.append(
+                    FieldCandidate(
+                        path=path,
+                        raw_value=selected,
+                        normalized_value=normalized.value,
+                        evidence_ids=[label.id],
+                        source=f"rule_{source_prefix}same_line",
+                        support_sources=[label.source],
+                        recognition_confidence=label.confidence,
+                        association_confidence=match,
+                        attempt=attempt,
+                        validation_codes=normalized.codes,
+                    )
                 )
-            )
         neighbours = _neighbours(label, spans, spec.strategies)
         # A strong nearest value is preferable to collecting unrelated fields farther below.
         # We keep multiple weak alternatives so the confidence layer can surface conflicts.
@@ -122,14 +184,17 @@ def _text_candidates(
         for geometry_score, value_span, strategy in neighbours[:2]:
             if _looks_like_any_label(value_span.text, blueprint):
                 continue
-            normalized = normalize_value(value_span.text, spec, blueprint.normalization)
+            selected = _select_value_part(value_span.text, value_part)
+            if selected is None:
+                continue
+            normalized = normalize_value(selected, spec, blueprint.normalization)
             found.append(
                 FieldCandidate(
                     path=path,
-                    raw_value=value_span.text,
+                    raw_value=selected,
                     normalized_value=normalized.value,
                     evidence_ids=[label.id, value_span.id],
-                    source=f"rule_{strategy}",
+                    source=f"rule_{source_prefix}{strategy}",
                     support_sources=list(
                         dict.fromkeys([label.source, value_span.source])
                     ),
@@ -140,6 +205,32 @@ def _text_candidates(
                 )
             )
     return found
+
+
+def _group_alias_score(text: str, aliases: Iterable[str]) -> float:
+    normalized = canonical_text(text)
+    best = alias_score(text, aliases)
+    for alias in aliases:
+        target = canonical_text(alias)
+        if target and (
+            normalized == target
+            or normalized.startswith(f"{target} ")
+            or normalized.startswith(f"{target}:")
+        ):
+            best = max(best, 1.0 if normalized == target else 0.96)
+    return best
+
+
+def _select_value_part(value: str, part: str) -> str | None:
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return None
+    if part == "first_token":
+        return cleaned.split(maxsplit=1)[0]
+    if part == "remaining_tokens":
+        pieces = cleaned.split(maxsplit=1)
+        return pieces[1] if len(pieces) == 2 else None
+    return cleaned
 
 
 def _same_line_suffix(text: str, aliases: Iterable[str]) -> str | None:
@@ -202,7 +293,7 @@ def _neighbours(
 
 def _looks_like_any_label(text: str, blueprint: DocumentBlueprint) -> bool:
     for spec in blueprint.fields.values():
-        if alias_score(text, spec.aliases) >= 0.93:
+        if alias_score(text, [*spec.aliases, *spec.group_aliases]) >= 0.93:
             return True
     return False
 
