@@ -22,20 +22,18 @@ The VLM gateway accepts loopback/private endpoints only when explicitly configur
 
 ```mermaid
 flowchart TD
-    A["Ingest + hash"] --> B["Quality assessment"]
-    B -->|"below 0.90, retry available"| C["Document enhancement"]
-    C --> B
-    B -->|"usable or retry exhausted"| D["Parallel evidence acquisition"]
-    D --> E["Blueprint + grounded mapping"]
-    E --> F["Normalize + validate + score"]
-    F -->|"all accepted"| G["Assemble result"]
-    F -->|"low confidence, retry available"| H["Targeted crop recovery"]
-    H --> F
-    F -->|"still unresolved"| I["Human review interrupt / queue"]
-    I --> G
+    A["Original + technical quality"] --> B["Baseline OCR, layout, controls"]
+    B --> C["Qwen structure + legibility"]
+    C -->|"readiness low"| D["Bounded OpenCV candidates"]
+    D -->|"measured OCR gain"| B
+    C -->|"ready"| E["Grounded mapping + validation"]
+    D -->|"no safe gain"| E
+    E -->|"accepted"| F["Assemble result"]
+    E -->|"unresolved"| G["Targeted recovery or review"]
+    G --> F
 ```
 
-Parallel evidence acquisition consists of layout parsing, exhaustive OCR, and form-control detection. A join node waits for all three before field mapping.
+Parallel evidence acquisition consists of layout parsing, exhaustive OCR, and form-control detection. A join node waits for all three before document understanding and field mapping. Qwen receives the actual image, but its first call returns only bounded structural and quality metadata—not extracted values.
 
 ## 3. Bounded self-resolution
 
@@ -45,13 +43,15 @@ The recovery planner chooses only from an enum of approved, deterministic action
 | --- | --- | --- |
 | small text | crop, 2x/3x Lanczos upscale | PaddleOCR crop + VLM crop |
 | low contrast | CLAHE | rerun recognizer |
-| uneven illumination | background normalization / adaptive threshold | rerun recognizer |
+| uneven illumination | color-preserving background normalization | rerun recognizer |
 | blur | denoise + unsharp mask | rerun and compare |
 | skew | estimated affine deskew | rerun affected page |
 | ambiguous checkbox | border suppression + binary variants | consensus of fill classifiers |
 | glare/occlusion | no destructive repair | human review |
 
-The graph has a document-quality retry limit and a field-recovery retry limit. It never recursively asks the model to “try something else.” Every retry records the selected strategy, parameters, before/after score, and artifact hash.
+The graph has a document-quality retry limit and a field-recovery retry limit. It never recursively asks the model to “try something else.” Qwen may choose only from a fixed profile enum and cannot provide transform parameters. For a full-page repair, the workflow creates at most three variants and selects one only when OCR readiness improves while high-confidence baseline text and detected controls are retained. Adaptive binarization and checkbox-focused thresholding are limited to targeted recovery crops.
+
+Document readiness combines observable technical quality, OCR readiness, and a categorical semantic factor. Qwen reports handwriting as `not_present`, `good`, `fair`, `poor`, or `unreadable`; deterministic code maps that category to an uncalibrated quality component. The original image remains immutable and is retained whenever no candidate demonstrates a measurable gain.
 
 ## 4. Grounding contract
 
@@ -120,10 +120,16 @@ option was circled or checked.
 
 Resolution order:
 
-1. known-template registration and ROIs;
-2. alias + geometry rules;
-3. layout-aware local VLM mapping with evidence IDs;
-4. review.
+1. whole-image document understanding against the configured blueprint;
+2. known-template registration and ROIs when available;
+3. alias + geometry rules;
+4. layout-aware local VLM mapping with evidence IDs;
+5. review.
+
+The understanding pass can mark the configured blueprint as `match`, `possible`,
+`mismatch`, or `unknown`. An explicit mismatch prevents automatic acceptance and
+routes fields to review. The current pipeline does not allow the model to create a
+schema or choose outside an application-provided blueprint registry.
 
 Blank form templates are especially valuable. After homography alignment, checkbox and fixed-field ROIs become far more reliable than generic detection.
 

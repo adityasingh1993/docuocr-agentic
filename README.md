@@ -7,18 +7,19 @@ The repository is deliberately **bounded-agentic**. LangGraph can retry approved
 ## Processing contract
 
 1. Ingest the image, hash it, and create an audit run.
-2. Score resolution, blur, contrast, illumination, glare, and skew.
-3. If document quality is below policy, apply a traceable OpenCV transform and rescore.
-4. In parallel:
+2. Score resolution, blur, contrast, illumination, glare, and skew without changing the original image.
+3. In parallel, acquire baseline evidence:
    - parse layout with PaddleOCR-VL;
    - run exhaustive box-level PaddleOCR;
    - detect checkbox/radio controls with OpenCV.
-5. Resolve a form blueprint and generate geometry-based field candidates.
-6. Ask a local VLM for unresolved mappings and visual re-checking of every checkbox/radio group. The VLM must cite existing OCR plus actual-image evidence IDs.
-7. Normalize and validate values with Pydantic and cross-field rules.
-8. Score every field. Values below `0.90` receive targeted crop enhancement and independent re-verification.
-9. Accept a value only when it is grounded, valid, and above policy. Otherwise pause/queue it for review.
-10. Emit the requested `data`/`meta` JSON plus a local evidence and trace bundle.
+4. Ask Qwen3-VL once for bounded document understanding: form/card family match, languages, regions, control groups, quality issues, and handwriting legibility. It never returns field values in this pass.
+5. When readiness is low, generate up to three approved OpenCV variants. Keep the original unless a fresh OCR pass shows a configured gain while retaining baseline text and controls; then reacquire evidence from the selected image.
+6. Resolve the configured form blueprint and generate geometry-based field candidates. An explicit VLM blueprint mismatch forces review rather than extraction against the wrong schema.
+7. Ask the local VLM for unresolved mappings and visual re-checking of every checkbox/radio group. The VLM must cite existing OCR plus actual-image evidence IDs.
+8. Normalize and validate values with Pydantic and cross-field rules.
+9. Score every field. Values below `0.90` receive targeted crop enhancement and independent re-verification.
+10. Accept a value only when it is grounded, valid, and above policy. Otherwise pause/queue it for review.
+11. Emit the requested `data`/`meta` JSON plus a local evidence and trace bundle.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed design and scaling path.
 
@@ -27,8 +28,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed design and scaling path.
 | Path | Responsibility | Never trusted for |
 | --- | --- | --- |
 | PaddleOCR | exhaustive text, scores, polygons | semantic field meaning by itself |
-| OpenCV | quality measurement, repair, checkbox/radio state | reading names or dates |
-| Local VLM | unfamiliar layout interpretation and crop verification | unsupported values or self-confidence |
+| OpenCV | technical quality, approved image variants, checkbox/radio state | reading names or dates |
+| Local VLM | document structure, handwriting legibility, unfamiliar layout interpretation, crop verification | unsupported values, free-form image editing, or self-confidence |
 
 PaddleOCR-VL remains useful for page structure, but its Markdown is not treated as the complete transcription. The general OCR pass is the evidence ledger.
 
@@ -81,6 +82,9 @@ vlm:
   model: mlx-community/Qwen3-VL-4B-Instruct-4bit
   api_key: local-only
   max_tokens: 2048
+  document_understanding_enabled: true
+  understanding_max_tokens: 1024
+  max_understanding_ocr_spans: 80
   max_paths_per_request: 4
   max_controls_per_request: 32
   request_retries: 1
@@ -184,6 +188,12 @@ deployed separately. Enable `layout_enabled` only after `layout_model_dir` and
 
 The example newborn-screening blueprint is in `config/blueprints/newborn_screening.yaml`. Add another YAML blueprint for each form family or country variant; do not fork the extraction code.
 
+The document-understanding pass compares the image with the configured blueprint and
+can return `match`, `possible`, `mismatch`, or `unknown`. The current CLI still receives
+one configured blueprint; it does not silently choose an unrestricted schema. A
+`mismatch` routes all fields to review. A future registry can use the same bounded
+analysis to select among an explicit set of known blueprints.
+
 Blueprint aliases may contain multiple languages. Deterministic rules and the
 VLM use translated/canonical printed labels only to locate a field. Entered or
 handwritten names, identifiers, dates, and free text are never translated; their
@@ -237,12 +247,19 @@ result.json
 trace.jsonl
 evidence.json
 images/
-  original-or-reference.txt
-  enhanced-*.png
+  original-reference.json
+  document-candidate-*.png
   crop-*.png
+document-understanding.json  # when the VLM analysis succeeds
 ```
 
-The trace stores hashes, model/config identities, transformation parameters, routing decisions, and evidence references. Raw field values are omitted from trace records by default. The protected `evidence.json` ledger stores OCR text, boxes, controls, and hashes so each reference can be audited; treat it as sensitive data. The business output keeps normalized values in `data` and raw pre-normalization values in `meta.pre`.
+The trace stores hashes, model/config identities, transformation parameters, routing decisions, and evidence references. Raw field values are omitted from trace records by default. The protected `evidence.json` ledger stores OCR text, boxes, controls, quality history, document understanding, enhancement evaluations, and hashes so each decision can be audited; treat it as sensitive data. The business output keeps normalized values in `data` and raw pre-normalization values in `meta.pre`.
+
+Full-page enhancement is deliberately non-generative. Qwen can recommend only
+`deskew`, `local_contrast`, `illumination_normalization`,
+`mild_denoise_sharpen`, `upscale`, or `none`. OpenCV uses fixed parameters, and
+full-page adaptive thresholding is prohibited because it can erase thin handwriting
+or create false checkbox marks.
 
 ## Confidence warning
 

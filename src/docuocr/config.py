@@ -21,6 +21,12 @@ class PolicySettings(SettingsModel):
     accept_threshold: float = Field(default=0.90, gt=0.0, le=1.0)
     document_quality_threshold: float = Field(default=0.90, gt=0.0, le=1.0)
     max_document_enhancements: int = Field(default=1, ge=0, le=5)
+    max_enhancement_variants: int = Field(default=3, ge=1, le=3)
+    enhancement_min_ocr_gain: float = Field(default=0.02, ge=0.0, le=1.0)
+    enhancement_min_text_retention: float = Field(default=0.80, ge=0.0, le=1.0)
+    enhancement_min_control_retention: float = Field(
+        default=0.75, ge=0.0, le=1.0
+    )
     max_field_retries: int = Field(default=2, ge=0, le=5)
     review_mode: Literal["queue", "interrupt"] = "queue"
 
@@ -65,6 +71,9 @@ class VLMSettings(SettingsModel):
     api_key: str = "local-only"
     timeout_seconds: float = Field(default=120.0, gt=0.0, le=900.0)
     max_tokens: int = Field(default=2048, ge=128, le=8192)
+    document_understanding_enabled: bool = True
+    understanding_max_tokens: int = Field(default=1024, ge=128, le=4096)
+    max_understanding_ocr_spans: int = Field(default=80, ge=0, le=500)
     max_paths_per_request: int = Field(default=4, ge=1, le=32)
     max_controls_per_request: int = Field(default=32, ge=0, le=256)
     request_retries: int = Field(default=1, ge=0, le=3)

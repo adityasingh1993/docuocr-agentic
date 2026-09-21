@@ -6,6 +6,10 @@ policy:
   accept_threshold: 0.90
   document_quality_threshold: 0.90
   max_document_enhancements: 1
+  max_enhancement_variants: 3
+  enhancement_min_ocr_gain: 0.02
+  enhancement_min_text_retention: 0.80
+  enhancement_min_control_retention: 0.75
   max_field_retries: 2
   review_mode: queue
 
@@ -32,6 +36,9 @@ vlm:
   api_key: local-only
   timeout_seconds: 120
   max_tokens: 2048
+  document_understanding_enabled: true
+  understanding_max_tokens: 1024
+  max_understanding_ocr_spans: 80
   max_paths_per_request: 4
   max_controls_per_request: 32
   request_retries: 1

@@ -116,6 +116,13 @@ class EvidenceRecord(StrictModel):
 
 
 class QualityReport(StrictModel):
+    """Technical image metrics plus optional evidence-derived readiness scores.
+
+    ``overall`` remains the deterministic OpenCV score.  The other aggregate
+    scores are populated only after OCR and, when enabled, document-level VLM
+    analysis.  They are deliberately marked uncalibrated.
+    """
+
     overall: float = Field(ge=0.0, le=1.0)
     resolution: float = Field(ge=0.0, le=1.0)
     sharpness: float = Field(ge=0.0, le=1.0)
@@ -128,6 +135,130 @@ class QualityReport(StrictModel):
     estimated_skew_degrees: float = 0.0
     issues: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    ocr_readiness: float | None = Field(default=None, ge=0.0, le=1.0)
+    semantic_quality: float | None = Field(default=None, ge=0.0, le=1.0)
+    handwriting_quality: float | None = Field(default=None, ge=0.0, le=1.0)
+    extraction_readiness: float | None = Field(default=None, ge=0.0, le=1.0)
+    calibrated: bool = False
+
+
+class OCRReadinessReport(StrictModel):
+    score: float = Field(ge=0.0, le=1.0)
+    span_count: int = Field(ge=0)
+    character_count: int = Field(ge=0)
+    mean_confidence: float = Field(ge=0.0, le=1.0)
+    high_confidence_fraction: float = Field(ge=0.0, le=1.0)
+
+
+class HandwritingLegibility(StrEnum):
+    NOT_PRESENT = "not_present"
+    GOOD = "good"
+    FAIR = "fair"
+    POOR = "poor"
+    UNREADABLE = "unreadable"
+
+
+class SchemaMatch(StrEnum):
+    MATCH = "match"
+    POSSIBLE = "possible"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
+class VisualIssueKind(StrEnum):
+    BLUR = "blur"
+    LOW_CONTRAST = "low_contrast"
+    UNEVEN_ILLUMINATION = "uneven_illumination"
+    GLARE = "glare"
+    SKEW = "skew"
+    PERSPECTIVE_DISTORTION = "perspective_distortion"
+    NOISE = "noise"
+    COMPRESSION = "compression"
+    OCCLUSION = "occlusion"
+    SMALL_TEXT = "small_text"
+    OVERWRITING = "overwriting"
+    OTHER = "other"
+
+
+class VisualIssueSeverity(StrEnum):
+    MILD = "mild"
+    MODERATE = "moderate"
+    SEVERE = "severe"
+
+
+class VisualIssueTarget(StrEnum):
+    DOCUMENT = "document"
+    PRINTED_TEXT = "printed_text"
+    HANDWRITING = "handwriting"
+    CONTROLS = "controls"
+
+
+class DocumentEnhancementProfile(StrEnum):
+    DESKEW = "deskew"
+    LOCAL_CONTRAST = "local_contrast"
+    ILLUMINATION_NORMALIZATION = "illumination_normalization"
+    MILD_DENOISE_SHARPEN = "mild_denoise_sharpen"
+    UPSCALE = "upscale"
+    NONE = "none"
+
+
+class DocumentRegion(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+    kind: Literal[
+        "header",
+        "section",
+        "table",
+        "field_group",
+        "control_group",
+        "footer",
+        "other",
+    ]
+    bbox: BBox | None = None
+
+
+class DocumentControlGroup(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+    kind: Literal["checkbox", "radio", "mixed", "unknown"]
+    exclusive: bool | None = None
+    option_labels: list[str] = Field(default_factory=list, max_length=12)
+    bbox: BBox | None = None
+
+
+class DocumentQualityIssue(StrictModel):
+    kind: VisualIssueKind
+    severity: VisualIssueSeverity
+    affects: list[VisualIssueTarget] = Field(min_length=1, max_length=4)
+    bbox: BBox | None = None
+
+
+class DocumentUnderstanding(StrictModel):
+    detected_document_type: str | None = Field(default=None, max_length=80)
+    schema_match: SchemaMatch = SchemaMatch.UNKNOWN
+    languages: list[str] = Field(default_factory=list, max_length=5)
+    handwriting_present: bool = False
+    handwriting_legibility: HandwritingLegibility = (
+        HandwritingLegibility.NOT_PRESENT
+    )
+    regions: list[DocumentRegion] = Field(default_factory=list, max_length=12)
+    control_groups: list[DocumentControlGroup] = Field(
+        default_factory=list, max_length=12
+    )
+    quality_issues: list[DocumentQualityIssue] = Field(
+        default_factory=list, max_length=12
+    )
+    recommended_profiles: list[DocumentEnhancementProfile] = Field(
+        default_factory=list, max_length=3
+    )
+
+    @model_validator(mode="after")
+    def consistent_handwriting_state(self) -> DocumentUnderstanding:
+        if not self.handwriting_present:
+            self.handwriting_legibility = HandwritingLegibility.NOT_PRESENT
+        elif self.handwriting_legibility == HandwritingLegibility.NOT_PRESENT:
+            raise ValueError(
+                "handwriting_legibility cannot be not_present when handwriting is present"
+            )
+        return self
 
 
 class EnhancementRecord(StrictModel):
@@ -184,9 +315,25 @@ class RecoveryAction(StrEnum):
     CLAHE = "clahe"
     DESKEW = "deskew"
     DENOISE_SHARPEN = "denoise_sharpen"
+    ILLUMINATION_NORMALIZATION = "illumination_normalization"
     ADAPTIVE_BINARIZE = "adaptive_binarize"
     CHECKBOX_FOCUS = "checkbox_focus"
     REVIEW = "review"
+
+
+class EnhancementEvaluation(StrictModel):
+    strategy: str
+    candidate_path: str
+    technical_before: float = Field(ge=0.0, le=1.0)
+    technical_after: float = Field(ge=0.0, le=1.0)
+    ocr_before: OCRReadinessReport
+    ocr_after: OCRReadinessReport
+    ocr_gain: float = Field(ge=-1.0, le=1.0)
+    text_retention: float = Field(ge=0.0, le=1.0)
+    control_retention: float = Field(ge=0.0, le=1.0)
+    eligible: bool = False
+    selected: bool = False
+    reason: str
 
 
 class RecoveryPlan(StrictModel):

@@ -97,6 +97,17 @@ class GraphIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(len(evidence["ocrSpans"]), 4)
             self.assertTrue(evidence["records"])
+            self.assertEqual(evidence["originalImagePath"], str(image_path.resolve()))
+            self.assertEqual(evidence["activeImagePath"], str(image_path.resolve()))
+            self.assertIn("qualityHistory", evidence)
+            self.assertIn("enhancementEvaluations", evidence)
+            trace_nodes = {
+                json.loads(line)["node"]
+                for line in (
+                    root / "artifacts" / "integration" / "trace.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            }
+            self.assertIn("document_understand", trace_nodes)
 
 
 def _span(

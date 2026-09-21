@@ -18,6 +18,7 @@ def build_graph(nodes: WorkflowNodes, *, checkpointer: Any = None) -> Any:
     builder.add_node("layout", nodes.layout)
     builder.add_node("ocr", nodes.ocr)
     builder.add_node("controls", nodes.controls)
+    builder.add_node("document_understand", nodes.document_understand)
     builder.add_node("map_rules", nodes.map_rules)
     builder.add_node("vlm_map", nodes.vlm_map)
     builder.add_node("score", nodes.score)
@@ -27,16 +28,21 @@ def build_graph(nodes: WorkflowNodes, *, checkpointer: Any = None) -> Any:
 
     builder.add_edge(START, "ingest")
     builder.add_edge("ingest", "assess_quality")
-    builder.add_conditional_edges(
-        "assess_quality",
-        lambda state: _quality_route(state, nodes),
-        {"enhance": "enhance_document", "extract": "extraction_start"},
-    )
-    builder.add_edge("enhance_document", "assess_quality")
+    builder.add_edge("assess_quality", "extraction_start")
     builder.add_edge("extraction_start", "layout")
     builder.add_edge("extraction_start", "ocr")
     builder.add_edge("extraction_start", "controls")
-    builder.add_edge(["layout", "ocr", "controls"], "map_rules")
+    builder.add_edge(["layout", "ocr", "controls"], "document_understand")
+    builder.add_conditional_edges(
+        "document_understand",
+        lambda state: _document_route(state, nodes),
+        {"enhance": "enhance_document", "map": "map_rules"},
+    )
+    builder.add_conditional_edges(
+        "enhance_document",
+        _enhancement_route,
+        {"reextract": "extraction_start", "map": "map_rules"},
+    )
     builder.add_edge("map_rules", "vlm_map")
     builder.add_edge("vlm_map", "score")
     builder.add_conditional_edges(
@@ -50,17 +56,27 @@ def build_graph(nodes: WorkflowNodes, *, checkpointer: Any = None) -> Any:
     return builder.compile(checkpointer=checkpointer)
 
 
-def _quality_route(
+def _document_route(
     state: DocumentState, nodes: WorkflowNodes
-) -> Literal["enhance", "extract"]:
-    quality = float(state.get("quality", {}).get("overall", 0.0))
+) -> Literal["enhance", "map"]:
+    quality_payload = state.get("quality", {})
+    readiness = quality_payload.get("extraction_readiness")
+    quality = float(
+        readiness if readiness is not None else quality_payload.get("overall", 0.0)
+    )
     attempts = int(state.get("document_attempt", 0))
     if (
         quality < nodes.settings.policy.document_quality_threshold
         and attempts < nodes.settings.policy.max_document_enhancements
     ):
         return "enhance"
-    return "extract"
+    return "map"
+
+
+def _enhancement_route(state: DocumentState) -> Literal["reextract", "map"]:
+    if state.get("enhancement_selected", False):
+        return "reextract"
+    return "map"
 
 
 def _score_route(state: DocumentState) -> Literal["recover", "review", "complete"]:

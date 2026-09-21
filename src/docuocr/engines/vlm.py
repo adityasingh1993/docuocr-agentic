@@ -4,7 +4,7 @@ import base64
 import json
 import mimetypes
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -12,7 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from docuocr.config import VLMSettings
 from docuocr.extraction.grounding import GroundedProposal
 from docuocr.extraction.rules import alias_score
-from docuocr.models import FormControl, LayoutBlock, OCRSpan
+from docuocr.models import (
+    DocumentUnderstanding,
+    FormControl,
+    LayoutBlock,
+    OCRSpan,
+    QualityReport,
+)
+
+StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
 
 
 class ProposalBatch(BaseModel):
@@ -23,6 +31,12 @@ class ProposalBatch(BaseModel):
 class VLMProposalResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     proposals: list[GroundedProposal] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class VLMUnderstandingResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    understanding: DocumentUnderstanding | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -53,6 +67,7 @@ class LocalVLMClient:
         controls: list[FormControl],
         image_evidence_id: str | None = None,
         field_hints: dict[str, dict[str, Any]] | None = None,
+        document_context: DocumentUnderstanding | None = None,
     ) -> VLMProposalResult:
         paths = list(dict.fromkeys(target_paths))
         if not paths:
@@ -81,10 +96,85 @@ class LocalVLMClient:
                     field_hints={
                         path: hints[path] for path in batch_paths if path in hints
                     },
+                    document_context=document_context,
                 )
                 result.proposals.extend(batch_result.proposals)
                 result.warnings.extend(batch_result.warnings)
         return result
+
+    def understand(
+        self,
+        *,
+        image_path: str | Path,
+        spans: list[OCRSpan],
+        blocks: list[LayoutBlock],
+        controls: list[FormControl],
+        quality: QualityReport,
+        expected_document_type: str,
+        anchors: list[str],
+        field_hints: dict[str, dict[str, Any]],
+    ) -> VLMUnderstandingResult:
+        """Analyze page structure and legibility without extracting field values."""
+
+        resolved_image = Path(image_path)
+        media_type = mimetypes.guess_type(str(resolved_image))[0] or "image/png"
+        encoded = base64.b64encode(resolved_image.read_bytes()).decode("ascii")
+        prompt = self._understanding_prompt(
+            spans=spans,
+            blocks=blocks,
+            controls=controls,
+            quality=quality,
+            expected_document_type=expected_document_type,
+            anchors=anchors,
+            field_hints=field_hints,
+        )
+        body = {
+            "model": self.settings.model,
+            "temperature": 0,
+            "max_tokens": self.settings.understanding_max_tokens,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You analyze document structure and visual readability. Do not "
+                        "extract or return field values. Use only the supplied categorical "
+                        "schema, and return one compact JSON object with no commentary."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{encoded}"
+                            },
+                        },
+                    ],
+                },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "document_understanding",
+                    "strict": True,
+                    "schema": DocumentUnderstanding.model_json_schema(),
+                },
+            },
+        }
+        try:
+            with httpx.Client(
+                timeout=self.settings.timeout_seconds,
+                transport=self._transport,
+            ) as client:
+                payload = self._post_chat(client, body)
+            understanding = _decode_structured(payload, DocumentUnderstanding)
+        except (httpx.HTTPError, VLMResponseError) as exc:
+            return VLMUnderstandingResult(
+                warnings=[f"vlm_understanding_failed:{_safe_error_message(exc)}"]
+            )
+        return VLMUnderstandingResult(understanding=understanding)
 
     def _propose_resilient(
         self,
@@ -98,6 +188,7 @@ class LocalVLMClient:
         controls: list[FormControl],
         image_evidence_id: str | None,
         field_hints: dict[str, dict[str, Any]],
+        document_context: DocumentUnderstanding | None,
     ) -> VLMProposalResult:
         try:
             proposals = self._request_batch(
@@ -110,6 +201,7 @@ class LocalVLMClient:
                 controls=controls,
                 image_evidence_id=image_evidence_id,
                 field_hints=field_hints,
+                document_context=document_context,
             )
         except VLMResponseError as exc:
             if len(target_paths) > 1:
@@ -133,6 +225,7 @@ class LocalVLMClient:
                             for path in subset
                             if path in field_hints
                         },
+                        document_context=document_context,
                     )
                     combined.proposals.extend(partial.proposals)
                     combined.warnings.extend(partial.warnings)
@@ -176,6 +269,7 @@ class LocalVLMClient:
         controls: list[FormControl],
         image_evidence_id: str | None,
         field_hints: dict[str, dict[str, Any]],
+        document_context: DocumentUnderstanding | None,
     ) -> list[GroundedProposal]:
         selected_controls = self._select_controls(
             target_paths, field_hints, spans, controls
@@ -187,6 +281,7 @@ class LocalVLMClient:
             blocks,
             selected_controls,
             image_evidence_id,
+            document_context,
         )
         schema = ProposalBatch.model_json_schema(by_alias=True)
         body = {
@@ -224,6 +319,12 @@ class LocalVLMClient:
                 },
             },
         }
+        payload = self._post_chat(client, body)
+        return _decode_proposals(payload)
+
+    def _post_chat(
+        self, client: httpx.Client, body: dict[str, Any]
+    ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.settings.api_key}"}
         url = f"{self.settings.base_url.rstrip('/')}/chat/completions"
         response: httpx.Response | None = None
@@ -238,10 +339,87 @@ class LocalVLMClient:
         if response is None:  # pragma: no cover - defensive; loop always sets or raises
             raise VLMResponseError("missing_http_response")
         try:
-            payload: dict[str, Any] = response.json()
+            return response.json()
         except ValueError as exc:
             raise VLMResponseError("invalid_http_json") from exc
-        return _decode_proposals(payload)
+
+    def _understanding_prompt(
+        self,
+        *,
+        spans: list[OCRSpan],
+        blocks: list[LayoutBlock],
+        controls: list[FormControl],
+        quality: QualityReport,
+        expected_document_type: str,
+        anchors: list[str],
+        field_hints: dict[str, dict[str, Any]],
+    ) -> str:
+        ordered_spans = sorted(
+            spans,
+            key=lambda item: (item.page, item.bbox.y1, item.bbox.x1),
+        )[: self.settings.max_understanding_ocr_spans]
+        ledger = {
+            "expectedDocumentType": expected_document_type,
+            "expectedAnchors": anchors,
+            "expectedFields": field_hints,
+            "imageSize": {"width": quality.width, "height": quality.height},
+            "technicalQuality": {
+                "overall": quality.overall,
+                "resolution": quality.resolution,
+                "sharpness": quality.sharpness,
+                "contrast": quality.contrast,
+                "illumination": quality.illumination,
+                "glare": quality.glare,
+                "skew": quality.skew,
+                "estimatedSkewDegrees": quality.estimated_skew_degrees,
+            },
+            "ocr": [
+                {
+                    "id": item.id,
+                    "text": item.text[:160],
+                    "confidence": item.confidence,
+                    "bbox": item.bbox.as_list(),
+                }
+                for item in ordered_spans
+            ],
+            "layout": [
+                {
+                    "id": item.id,
+                    "label": item.label,
+                    "bbox": item.bbox.as_list(),
+                }
+                for item in blocks[:40]
+            ],
+            "controls": [
+                {
+                    "id": item.id,
+                    "kind": item.kind.value,
+                    "stateHint": item.state.value,
+                    "bbox": item.bbox.as_list(),
+                }
+                for item in controls[
+                    : min(24, self.settings.max_controls_per_request)
+                ]
+            ],
+        }
+        return (
+            "Analyze the complete supplied document image before field extraction. "
+            "Return structural and quality metadata only; never return names, dates, "
+            "identifiers, handwritten text, or any other field value. Printed labels may "
+            "be interpreted across languages only to understand document structure and "
+            "compare it with expectedDocumentType. Assess handwriting visually as "
+            "not_present, good, fair, poor, or unreadable. Identify at most 12 major "
+            "regions, 12 control groups, and 12 quality issues. Region names and control "
+            "option labels must be generic printed labels, never entered content. Bboxes "
+            "use image pixel coordinates [x1,y1,x2,y2]. Recommend at most three profiles "
+            "and only from "
+            "deskew, local_contrast, illumination_normalization, "
+            "mild_denoise_sharpen, upscale, or none. Do not propose generative repair, "
+            "binarization, arbitrary parameters, or confidence. OCR and detector states "
+            "are hints; judge visible structure and legibility from the actual image. "
+            "Return compact JSON only. Analysis ledger:\n"
+            + json.dumps(ledger, ensure_ascii=False, separators=(",", ":"))
+        )
 
     def _select_controls(
         self,
@@ -288,6 +466,7 @@ class LocalVLMClient:
         blocks: list[LayoutBlock],
         controls: list[FormControl],
         image_evidence_id: str | None,
+        document_context: DocumentUnderstanding | None,
     ) -> str:
         ledger = {
             "allowedPaths": target_paths,
@@ -315,6 +494,11 @@ class LocalVLMClient:
                 for item in controls
             ],
             "imageEvidenceId": image_evidence_id,
+            "documentContext": (
+                document_context.model_dump(mode="json")
+                if document_context is not None
+                else None
+            ),
         }
         return (
             "Propose values only for allowedPaths. Each proposal must contain path, "
@@ -330,12 +514,19 @@ class LocalVLMClient:
             "a boolean proposal for every allowed option in that group. Cite "
             "imageEvidenceId plus the option or group-label OCR evidence when available. "
             "Do not cite a detector control that conflicts with the pixels. Do not provide "
-            "confidence. Return compact JSON only. Evidence ledger:\n"
+            "confidence. documentContext is advisory and never substitutes for cited "
+            "field evidence. Return compact JSON only. Evidence ledger:\n"
             + json.dumps(ledger, ensure_ascii=False, separators=(",", ":"))
         )
 
 
 def _decode_proposals(payload: dict[str, Any]) -> list[GroundedProposal]:
+    return _decode_structured(payload, ProposalBatch).proposals
+
+
+def _decode_structured(
+    payload: dict[str, Any], model: type[StructuredModel]
+) -> StructuredModel:
     try:
         choice = payload["choices"][0]
         finish_reason = choice.get("finish_reason")
@@ -344,24 +535,29 @@ def _decode_proposals(payload: dict[str, Any]) -> list[GroundedProposal]:
         raise VLMResponseError("missing_response_content") from exc
     if finish_reason == "length":
         raise VLMResponseError("truncated_response:finish_reason=length")
-    if isinstance(content, list):
-        content = "".join(
-            str(item.get("text", "")) for item in content if isinstance(item, dict)
-        )
-    text = str(content).strip()
-    if not text:
-        raise VLMResponseError("empty_response_content")
-    start = text.find("{")
-    if start < 0:
-        raise VLMResponseError("json_object_not_found")
+    if isinstance(content, dict):
+        decoded: Any = content
+    else:
+        if isinstance(content, list):
+            content = "".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict)
+            )
+        text = str(content).strip()
+        if not text:
+            raise VLMResponseError("empty_response_content")
+        start = text.find("{")
+        if start < 0:
+            raise VLMResponseError("json_object_not_found")
+        try:
+            decoded, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError as exc:
+            raise VLMResponseError(
+                f"invalid_json_response:{exc.msg}:position={exc.pos}"
+            ) from exc
     try:
-        decoded, _ = json.JSONDecoder().raw_decode(text[start:])
-    except json.JSONDecodeError as exc:
-        raise VLMResponseError(
-            f"invalid_json_response:{exc.msg}:position={exc.pos}"
-        ) from exc
-    try:
-        return ProposalBatch.model_validate(decoded).proposals
+        return model.model_validate(decoded)
     except ValidationError as exc:
         raise VLMResponseError(
             f"invalid_response_schema:{exc.error_count()}_errors"

@@ -14,6 +14,7 @@ class DocumentState(TypedDict, total=False):
     job_id: str
     thread_id: str
     source_path: str
+    original_image_path: str
     active_image_path: str
     run_dir: str
     original_sha256: str
@@ -25,6 +26,11 @@ class DocumentState(TypedDict, total=False):
     quality: dict[str, Any]
     quality_history: Annotated[list[dict[str, Any]], operator.add]
     enhancements: Annotated[list[dict[str, Any]], operator.add]
+    enhancement_evaluations: Annotated[list[dict[str, Any]], operator.add]
+    enhancement_selected: bool
+    document_understanding: dict[str, Any]
+    document_understanding_attempted: bool
+    document_understanding_image_sha256: str
     layout_blocks: list[dict[str, Any]]
     ocr_spans: list[dict[str, Any]]
     controls: list[dict[str, Any]]

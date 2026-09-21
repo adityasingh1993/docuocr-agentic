@@ -15,7 +15,12 @@ from docuocr.contract import (
     ProcessorStep,
 )
 from docuocr.cv.enhance import ImageEnhancer
-from docuocr.cv.quality import ImageQualityAssessor
+from docuocr.cv.quality import (
+    ImageQualityAssessor,
+    assess_ocr_readiness,
+    enrich_quality_report,
+    evaluate_enhancement,
+)
 from docuocr.engines.base import ControlEngine, LayoutEngine, TextEngine
 from docuocr.engines.vlm import LocalVLMClient
 from docuocr.extraction.blueprint import DocumentBlueprint
@@ -25,6 +30,8 @@ from docuocr.extraction.rules import associate_controls, map_rule_candidates
 from docuocr.extraction.validation import validate_candidates
 from docuocr.models import (
     BBox,
+    DocumentUnderstanding,
+    EnhancementEvaluation,
     EvidenceKind,
     EvidenceRecord,
     FieldCandidate,
@@ -35,6 +42,7 @@ from docuocr.models import (
     QualityReport,
     RecoveryAction,
     RecoveryPlan,
+    SchemaMatch,
 )
 from docuocr.state import DocumentState
 from docuocr.trace import TraceWriter, sha256_file, sha256_json, utc_now
@@ -79,12 +87,14 @@ class WorkflowNodes:
             )
             return {
                 "source_path": str(source),
+                "original_image_path": str(source),
                 "active_image_path": str(source),
                 "run_dir": str(run_dir),
                 "original_sha256": original_sha,
                 "blueprint_id": self.blueprint.id,
                 "started_at": utc_now(),
                 "document_attempt": 0,
+                "document_understanding_attempted": False,
                 "field_attempt": 0,
                 "errors": [],
                 "warnings": [],
@@ -102,18 +112,12 @@ class WorkflowNodes:
             warnings = []
             if report.overall < self.settings.policy.document_quality_threshold:
                 warnings.append("document_quality_below_policy")
-            route = (
-                "enhance"
-                if report.overall < self.settings.policy.document_quality_threshold
-                and attempt < self.settings.policy.max_document_enhancements
-                else "extract"
-            )
             return {
                 "quality": report.model_dump(mode="json"),
                 "quality_history": [report.model_dump(mode="json")],
                 "warnings": warnings,
                 "_stage_confidence": report.overall,
-                "_decision": route,
+                "_decision": "acquire_baseline_evidence",
             }
 
         return self._execute(
@@ -124,36 +128,170 @@ class WorkflowNodes:
         attempt = state.get("document_attempt", 0) + 1
 
         def work() -> dict[str, Any]:
-            quality = QualityReport.model_validate(state["quality"])
-            output = (
-                Path(state["run_dir"]) / "images" / f"document-enhanced-{attempt}.png"
+            baseline_quality = QualityReport.model_validate(state["quality"])
+            baseline_spans = _models(OCRSpan, state.get("ocr_spans", []))
+            baseline_controls = _models(FormControl, state.get("controls", []))
+            understanding = _document_understanding(state)
+            profiles = (
+                understanding.recommended_profiles if understanding is not None else []
             )
-            record = self.enhancer.apply(
-                state["active_image_path"],
-                output,
-                self.enhancer.plan_for_quality(quality),
-                attempt=attempt,
-                skew_degrees=quality.estimated_skew_degrees,
+            variants = self.enhancer.plan_variants(
+                baseline_quality,
+                profiles,
+                max_variants=self.settings.policy.max_enhancement_variants,
             )
+            warnings: list[str] = []
+            if not variants:
+                warnings.append("document_enhancement_no_safe_profile")
+                return {
+                    "active_image_path": state["active_image_path"],
+                    "document_attempt": attempt,
+                    "quality": baseline_quality.model_dump(mode="json"),
+                    "enhancements": [],
+                    "enhancement_evaluations": [],
+                    "enhancement_selected": False,
+                    "warnings": warnings,
+                    "_stage_confidence": _effective_quality(baseline_quality),
+                    "_decision": "original_retained",
+                }
+
+            evaluations: list[EnhancementEvaluation] = []
+            records: list[dict[str, Any]] = []
+            candidates: list[tuple[Path, QualityReport, float, int]] = []
+            run_images = Path(state["run_dir"]) / "images"
+            for index, actions in enumerate(variants):
+                output = run_images / f"document-candidate-{attempt}-{index:02d}.png"
+                strategy = "+".join(item.value for item in actions)
+                try:
+                    record = self.enhancer.apply(
+                        state["active_image_path"],
+                        output,
+                        actions,
+                        attempt=attempt,
+                        skew_degrees=baseline_quality.estimated_skew_degrees,
+                    )
+                    records.append(record.model_dump(mode="json"))
+                    candidate_quality = self.quality_assessor.assess(output)
+                    candidate_spans = self.text_engine.extract(
+                        output,
+                        attempt=attempt,
+                        id_prefix=f"ocr:probe{attempt}:{index:02d}",
+                    )
+                    candidate_controls = self.control_engine.detect(
+                        output,
+                        attempt=attempt,
+                        id_prefix=f"control:probe{attempt}:{index:02d}",
+                    )
+                except Exception as exc:
+                    warnings.append(
+                        f"document_enhancement_probe_failed:{strategy}:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    continue
+
+                candidate_ocr = assess_ocr_readiness(candidate_spans)
+                enriched_quality = enrich_quality_report(
+                    candidate_quality,
+                    ocr=candidate_ocr,
+                    understanding=understanding,
+                )
+                evaluation = evaluate_enhancement(
+                    strategy=strategy,
+                    candidate_path=str(output),
+                    baseline_quality=baseline_quality,
+                    candidate_quality=candidate_quality,
+                    baseline_spans=baseline_spans,
+                    candidate_spans=candidate_spans,
+                    baseline_control_count=len(baseline_controls),
+                    candidate_control_count=len(candidate_controls),
+                    min_ocr_gain=self.settings.policy.enhancement_min_ocr_gain,
+                    min_text_retention=(
+                        self.settings.policy.enhancement_min_text_retention
+                    ),
+                    min_control_retention=(
+                        self.settings.policy.enhancement_min_control_retention
+                    ),
+                    ocr_engine_enabled=self.text_engine.model_id != "disabled",
+                )
+                evaluations.append(evaluation)
+                candidates.append(
+                    (
+                        output,
+                        enriched_quality,
+                        evaluation.ocr_after.score,
+                        len(evaluations) - 1,
+                    )
+                )
+
+            eligible_candidates = [
+                item for item in candidates if evaluations[item[3]].eligible
+            ]
+            selected = max(
+                eligible_candidates,
+                key=lambda item: (
+                    item[2],
+                    _effective_quality(item[1]),
+                    item[1].overall,
+                ),
+                default=None,
+            )
+            if selected is None:
+                active_image = state["active_image_path"]
+                selected_quality = baseline_quality
+                decision = "original_retained"
+                warnings.append("document_enhancement_rejected_no_measured_gain")
+                enhancement_selected = False
+            else:
+                active_image = str(selected[0])
+                selected_quality = selected[1]
+                selected_index = selected[3]
+                evaluations[selected_index] = evaluations[selected_index].model_copy(
+                    update={"selected": True, "reason": "selected_best_ocr_gain"}
+                )
+                decision = f"enhanced_selected:{evaluations[selected_index].strategy}"
+                enhancement_selected = True
             return {
-                "active_image_path": str(output),
+                "active_image_path": active_image,
                 "document_attempt": attempt,
-                "enhancements": [record.model_dump(mode="json")],
-                "_stage_confidence": 1.0,
+                "quality": selected_quality.model_dump(mode="json"),
+                "quality_history": [
+                    item[1].model_dump(mode="json") for item in candidates
+                ],
+                "enhancements": records,
+                "enhancement_evaluations": [
+                    item.model_dump(mode="json") for item in evaluations
+                ],
+                "enhancement_selected": enhancement_selected,
+                "warnings": warnings,
+                "_stage_confidence": _effective_quality(selected_quality),
+                "_decision": decision,
             }
 
         return self._execute(
-            "enhance_document", state, attempt, work, model_id="opencv-enhance-v1"
+            "enhance_document",
+            state,
+            attempt,
+            work,
+            model_id="opencv+paddle-quality-selection-v1",
         )
 
     def extraction_start(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
         return self._execute(
-            "extraction_start", state, 0, lambda: {"_stage_confidence": 1.0}
+            "extraction_start",
+            state,
+            attempt,
+            lambda: {"_stage_confidence": 1.0},
         )
 
     def layout(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
+
         def work() -> dict[str, Any]:
-            blocks = self.layout_engine.parse(state["active_image_path"])
+            prefix = "layout" if attempt == 0 else f"layout:doc{attempt}"
+            blocks = self.layout_engine.parse(
+                state["active_image_path"], attempt=attempt, id_prefix=prefix
+            )
             evidence = [_layout_evidence(item) for item in blocks]
             return {
                 "layout_blocks": [item.model_dump(mode="json") for item in blocks],
@@ -163,12 +301,17 @@ class WorkflowNodes:
             }
 
         return self._execute(
-            "layout", state, 0, work, model_id=self.layout_engine.model_id
+            "layout", state, attempt, work, model_id=self.layout_engine.model_id
         )
 
     def ocr(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
+
         def work() -> dict[str, Any]:
-            spans = self.text_engine.extract(state["active_image_path"])
+            prefix = "ocr" if attempt == 0 else f"ocr:doc{attempt}"
+            spans = self.text_engine.extract(
+                state["active_image_path"], attempt=attempt, id_prefix=prefix
+            )
             evidence = [_ocr_evidence(item) for item in spans]
             return {
                 "ocr_spans": [item.model_dump(mode="json") for item in spans],
@@ -177,11 +320,18 @@ class WorkflowNodes:
                 "_stage_confidence": _mean([item.confidence for item in spans]),
             }
 
-        return self._execute("ocr", state, 0, work, model_id=self.text_engine.model_id)
+        return self._execute(
+            "ocr", state, attempt, work, model_id=self.text_engine.model_id
+        )
 
     def controls(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
+
         def work() -> dict[str, Any]:
-            controls = self.control_engine.detect(state["active_image_path"])
+            prefix = "control" if attempt == 0 else f"control:doc{attempt}"
+            controls = self.control_engine.detect(
+                state["active_image_path"], attempt=attempt, id_prefix=prefix
+            )
             evidence = [_control_evidence(item) for item in controls]
             return {
                 "controls": [item.model_dump(mode="json") for item in controls],
@@ -193,16 +343,123 @@ class WorkflowNodes:
             }
 
         return self._execute(
-            "controls", state, 0, work, model_id=self.control_engine.model_id
+            "controls", state, attempt, work, model_id=self.control_engine.model_id
+        )
+
+    def document_understand(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
+
+        def work() -> dict[str, Any]:
+            technical = QualityReport.model_validate(state["quality"])
+            spans = _models(OCRSpan, state.get("ocr_spans", []))
+            blocks = _models(LayoutBlock, state.get("layout_blocks", []))
+            controls = _models(FormControl, state.get("controls", []))
+            ocr_report = (
+                None
+                if self.text_engine.model_id == "disabled"
+                else assess_ocr_readiness(spans)
+            )
+            understanding = _document_understanding(state)
+            warnings: list[str] = []
+            decision = "cached"
+            analysis_sha = state.get("document_understanding_image_sha256")
+            if not state.get("document_understanding_attempted", False):
+                if (
+                    self.vlm is not None
+                    and self.settings.vlm.document_understanding_enabled
+                ):
+                    active_image = Path(state["active_image_path"])
+                    result = self.vlm.understand(
+                        image_path=active_image,
+                        spans=spans,
+                        blocks=blocks,
+                        controls=controls,
+                        quality=technical,
+                        expected_document_type=self.blueprint.document_type,
+                        anchors=self.blueprint.anchors,
+                        field_hints=self.blueprint.vlm_hints(
+                            self.blueprint.output_paths
+                        ),
+                    )
+                    understanding = result.understanding
+                    warnings.extend(result.warnings)
+                    analysis_sha = sha256_file(active_image)
+                    decision = "analyzed" if understanding is not None else "failed"
+                    if understanding is not None:
+                        analysis_path = (
+                            Path(state["run_dir"]) / "document-understanding.json"
+                        )
+                        analysis_path.write_text(
+                            json.dumps(
+                                {
+                                    "imageSha256": analysis_sha,
+                                    "modelId": self.vlm.model_id,
+                                    "analysis": understanding.model_dump(mode="json"),
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                else:
+                    decision = "disabled"
+
+            enriched = enrich_quality_report(
+                technical,
+                ocr=ocr_report,
+                understanding=understanding,
+            )
+            if (
+                enriched.extraction_readiness is not None
+                and enriched.extraction_readiness
+                < self.settings.policy.document_quality_threshold
+            ):
+                warnings.append("extraction_readiness_below_policy")
+            if (
+                understanding is not None
+                and understanding.schema_match == SchemaMatch.MISMATCH
+            ):
+                warnings.append("configured_blueprint_mismatch")
+            update: dict[str, Any] = {
+                "quality": enriched.model_dump(mode="json"),
+                "quality_history": [enriched.model_dump(mode="json")],
+                "document_understanding_attempted": True,
+                "warnings": warnings,
+                "_stage_confidence": _effective_quality(enriched),
+                "_decision": decision,
+            }
+            if understanding is not None:
+                update["document_understanding"] = understanding.model_dump(
+                    mode="json"
+                )
+            if analysis_sha:
+                update["document_understanding_image_sha256"] = analysis_sha
+            return update
+
+        return self._execute(
+            "document_understand",
+            state,
+            attempt,
+            work,
+            model_id=(
+                self.vlm.model_id
+                if self.vlm is not None
+                and self.settings.vlm.document_understanding_enabled
+                else "deterministic-quality-fusion-v1"
+            ),
         )
 
     def map_rules(self, state: DocumentState) -> dict[str, Any]:
+        attempt = state.get("document_attempt", 0)
+
         def work() -> dict[str, Any]:
             spans = _models(OCRSpan, state.get("ocr_spans", []))
             controls = associate_controls(
                 _models(FormControl, state.get("controls", [])), spans
             )
-            candidates = map_rule_candidates(self.blueprint, spans, controls)
+            candidates = map_rule_candidates(
+                self.blueprint, spans, controls, attempt=attempt
+            )
             covered = {
                 item.path for item in candidates if item.normalized_value is not None
             }
@@ -214,10 +471,16 @@ class WorkflowNodes:
             }
 
         return self._execute(
-            "map_rules", state, 0, work, model_id=f"blueprint:{self.blueprint.id}"
+            "map_rules",
+            state,
+            attempt,
+            work,
+            model_id=f"blueprint:{self.blueprint.id}",
         )
 
     def vlm_map(self, state: DocumentState) -> dict[str, Any]:
+        document_attempt = state.get("document_attempt", 0)
+
         def work() -> dict[str, Any]:
             candidates = _models(FieldCandidate, state.get("candidates", []))
             if self.vlm is None:
@@ -239,7 +502,7 @@ class WorkflowNodes:
                 id="image:vlm:p1:active",
                 kind=EvidenceKind.IMAGE,
                 bbox=BBox(x1=0, y1=0, x2=quality.width, y2=quality.height),
-                confidence=quality.overall,
+                confidence=_effective_quality(quality),
                 source="document_image",
                 artifact_path=str(active_image),
                 artifact_sha256=sha256_file(active_image),
@@ -254,9 +517,10 @@ class WorkflowNodes:
                 blocks=_models(LayoutBlock, state.get("layout_blocks", [])),
                 controls=_models(FormControl, state.get("controls", [])),
                 evidence=evidence,
-                attempt=0,
+                attempt=document_attempt,
                 visual_verification=True,
                 image_evidence_id=image_evidence.id,
+                document_context=_document_understanding(state),
             )
             merged, reconciliation_warnings = _reconcile_visual_controls(
                 candidates + additions, checkbox_paths
@@ -272,7 +536,7 @@ class WorkflowNodes:
         return self._execute(
             "vlm_map",
             state,
-            0,
+            document_attempt,
             work,
             model_id=self.vlm.model_id if self.vlm else "disabled",
         )
@@ -288,10 +552,29 @@ class WorkflowNodes:
             decisions = self.scorer.decide(
                 candidates,
                 self.blueprint,
-                image_quality=quality.overall,
+                image_quality=_effective_quality(quality),
                 attempt=attempt,
                 max_retries=self.settings.policy.max_field_retries,
             )
+            understanding = _document_understanding(state)
+            if (
+                understanding is not None
+                and understanding.schema_match == SchemaMatch.MISMATCH
+            ):
+                decisions = {
+                    path: decision.model_copy(
+                        update={
+                            "score": min(decision.score, 0.49),
+                            "disposition": "review",
+                            "reasons": list(
+                                dict.fromkeys(
+                                    [*decision.reasons, "document_schema_mismatch"]
+                                )
+                            ),
+                        }
+                    )
+                    for path, decision in decisions.items()
+                }
             evidence = _models(EvidenceRecord, state.get("evidence", []))
             plans = self.scorer.recovery_plans(decisions, evidence, attempt=attempt + 1)
             unresolved = [
@@ -457,6 +740,20 @@ class WorkflowNodes:
                 json.dumps(
                     {
                         "originalSha256": state.get("original_sha256"),
+                        "originalImagePath": state.get("original_image_path"),
+                        "activeImagePath": state.get("active_image_path"),
+                        "quality": state.get("quality"),
+                        "qualityHistory": state.get("quality_history", []),
+                        "documentUnderstanding": state.get(
+                            "document_understanding"
+                        ),
+                        "documentUnderstandingImageSha256": state.get(
+                            "document_understanding_image_sha256"
+                        ),
+                        "enhancements": state.get("enhancements", []),
+                        "enhancementEvaluations": state.get(
+                            "enhancement_evaluations", []
+                        ),
                         "records": state.get("evidence", []),
                         "ocrSpans": state.get("ocr_ledger", []),
                         "layoutBlocks": state.get("layout_ledger", []),
@@ -512,7 +809,7 @@ class WorkflowNodes:
             [RecoveryAction.CLAHE, RecoveryAction.DENOISE_SHARPEN],
             attempt=attempt,
         )
-        quality = self.quality_assessor.assess(output)
+        technical_quality = self.quality_assessor.assess(output)
         target_paths = [item.field_path for item in plans]
         prefix = f"retry{attempt}"
         spans = self.text_engine.extract(
@@ -522,6 +819,11 @@ class WorkflowNodes:
             output, attempt=attempt, id_prefix=f"control:{prefix}"
         )
         controls = associate_controls(controls, spans)
+        quality = enrich_quality_report(
+            technical_quality,
+            ocr=assess_ocr_readiness(spans),
+            understanding=_document_understanding(state),
+        )
         candidates = map_rule_candidates(
             self.blueprint,
             spans,
@@ -533,7 +835,7 @@ class WorkflowNodes:
             id=f"crop:{prefix}:page",
             kind=EvidenceKind.CROP,
             bbox=BBox(x1=0, y1=0, x2=quality.width, y2=quality.height),
-            confidence=quality.overall,
+            confidence=_effective_quality(quality),
             source="opencv_enhancement",
             artifact_path=str(output),
             artifact_sha256=record.output_sha256,
@@ -556,6 +858,7 @@ class WorkflowNodes:
                 attempt=attempt,
                 visual_verification=True,
                 image_evidence_id=image_evidence.id,
+                document_context=_document_understanding(state),
             )
             candidates.extend(additions)
             warnings.extend(vlm_warnings)
@@ -630,6 +933,7 @@ class WorkflowNodes:
                     attempt=attempt,
                     visual_verification=True,
                     image_evidence_id=crop_evidence.id,
+                    document_context=_document_understanding(state),
                 )
                 candidates.extend(additions)
                 warnings.extend(vlm_warnings)
@@ -661,6 +965,7 @@ class WorkflowNodes:
         attempt: int,
         visual_verification: bool,
         image_evidence_id: str | None = None,
+        document_context: DocumentUnderstanding | None = None,
     ) -> tuple[list[FieldCandidate], list[str]]:
         if self.vlm is None:
             return [], []
@@ -672,6 +977,7 @@ class WorkflowNodes:
             controls=controls,
             image_evidence_id=image_evidence_id,
             field_hints=self.blueprint.vlm_hints(target_paths),
+            document_context=document_context,
         )
         candidates: list[FieldCandidate] = []
         warnings = list(result.warnings)
@@ -750,7 +1056,12 @@ class WorkflowNodes:
         ]
         confidence = stage_confidence
         if isinstance(update.get("quality"), dict):
-            confidence = update["quality"].get("overall")
+            readiness = update["quality"].get("extraction_readiness")
+            confidence = (
+                readiness
+                if readiness is not None
+                else update["quality"].get("overall")
+            )
         step = ProcessorStep(
             name=name,
             status=status,
@@ -905,6 +1216,19 @@ def _control_evidence(item: FormControl) -> EvidenceRecord:
 
 def _models(model: Any, values: list[dict[str, Any]]) -> list[Any]:
     return [model.model_validate(value) for value in values]
+
+
+def _document_understanding(state: DocumentState) -> DocumentUnderstanding | None:
+    payload = state.get("document_understanding")
+    return DocumentUnderstanding.model_validate(payload) if payload else None
+
+
+def _effective_quality(report: QualityReport) -> float:
+    return (
+        report.extraction_readiness
+        if report.extraction_readiness is not None
+        else report.overall
+    )
 
 
 def _set_path(root: dict[str, Any], dotted: str, value: Any) -> None:

@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import math
+import re
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 
-from docuocr.models import QualityReport
+from docuocr.models import (
+    DocumentUnderstanding,
+    EnhancementEvaluation,
+    HandwritingLegibility,
+    OCRReadinessReport,
+    OCRSpan,
+    QualityReport,
+    VisualIssueSeverity,
+)
 
 
 def _cv2():
@@ -93,7 +103,7 @@ class ImageQualityAssessor:
             recommendations.append("clahe")
         if illumination < 0.80:
             issues.append("uneven_illumination")
-            recommendations.append("adaptive_binarize")
+            recommendations.append("illumination_normalization")
         if glare < 0.75:
             issues.append("glare_or_saturation")
         if skew < 0.85:
@@ -141,3 +151,177 @@ class ImageQualityAssessor:
             if abs(angle) <= 15:
                 angles.append(angle)
         return float(np.median(angles)) if angles else 0.0
+
+
+def assess_ocr_readiness(spans: list[OCRSpan]) -> OCRReadinessReport:
+    """Score observable OCR output without treating it as calibrated accuracy."""
+
+    weighted_confidence = 0.0
+    high_confidence_characters = 0
+    character_count = 0
+    usable_spans = 0
+    for span in spans:
+        count = sum(not character.isspace() for character in span.text.strip())
+        if count == 0:
+            continue
+        usable_spans += 1
+        character_count += count
+        weighted_confidence += span.confidence * count
+        if span.confidence >= 0.80:
+            high_confidence_characters += count
+
+    if character_count == 0:
+        return OCRReadinessReport(
+            score=0.0,
+            span_count=0,
+            character_count=0,
+            mean_confidence=0.0,
+            high_confidence_fraction=0.0,
+        )
+
+    mean_confidence = weighted_confidence / character_count
+    high_fraction = high_confidence_characters / character_count
+    coverage = 1.0 - math.exp(-character_count / 120.0)
+    score = 0.65 * mean_confidence + 0.20 * high_fraction + 0.15 * coverage
+    return OCRReadinessReport(
+        score=float(np.clip(score, 0.0, 1.0)),
+        span_count=usable_spans,
+        character_count=character_count,
+        mean_confidence=float(np.clip(mean_confidence, 0.0, 1.0)),
+        high_confidence_fraction=float(np.clip(high_fraction, 0.0, 1.0)),
+    )
+
+
+def enrich_quality_report(
+    report: QualityReport,
+    *,
+    ocr: OCRReadinessReport | None,
+    understanding: DocumentUnderstanding | None,
+) -> QualityReport:
+    """Fuse technical, OCR, and semantic signals into an uncalibrated readiness score."""
+
+    handwriting_score: float | None = None
+    semantic_score: float | None = None
+    if understanding is not None:
+        handwriting_score = {
+            HandwritingLegibility.NOT_PRESENT: 1.0,
+            HandwritingLegibility.GOOD: 0.95,
+            HandwritingLegibility.FAIR: 0.72,
+            HandwritingLegibility.POOR: 0.42,
+            HandwritingLegibility.UNREADABLE: 0.10,
+        }[understanding.handwriting_legibility]
+        issue_score = 1.0
+        for issue in understanding.quality_issues:
+            issue_score = min(
+                issue_score,
+                {
+                    VisualIssueSeverity.MILD: 0.88,
+                    VisualIssueSeverity.MODERATE: 0.65,
+                    VisualIssueSeverity.SEVERE: 0.35,
+                }[issue.severity],
+            )
+        semantic_score = min(issue_score, handwriting_score)
+
+    components: list[tuple[float, float]] = [(report.overall, 0.55)]
+    if ocr is not None:
+        components.append((ocr.score, 0.30))
+    if semantic_score is not None:
+        components.append((semantic_score, 0.15))
+    weight_total = sum(weight for _, weight in components)
+    readiness = math.exp(
+        sum(
+            (weight / weight_total) * math.log(max(value, 1e-6))
+            for value, weight in components
+        )
+    )
+    return report.model_copy(
+        update={
+            "ocr_readiness": ocr.score if ocr is not None else None,
+            "semantic_quality": semantic_score,
+            "handwriting_quality": handwriting_score,
+            "extraction_readiness": float(np.clip(readiness, 0.0, 1.0)),
+            "calibrated": False,
+        }
+    )
+
+
+def high_confidence_text_retention(
+    baseline: list[OCRSpan], candidate: list[OCRSpan]
+) -> float:
+    """Fraction of stable baseline tokens still present after enhancement."""
+
+    baseline_tokens = _tokens(
+        span.text for span in baseline if span.confidence >= 0.80
+    )
+    if not baseline_tokens:
+        return 1.0
+    candidate_tokens = _tokens(span.text for span in candidate)
+    return len(baseline_tokens & candidate_tokens) / len(baseline_tokens)
+
+
+def control_count_retention(baseline_count: int, candidate_count: int) -> float:
+    if baseline_count <= 0:
+        return 1.0
+    return min(1.0, candidate_count / baseline_count)
+
+
+def evaluate_enhancement(
+    *,
+    strategy: str,
+    candidate_path: str,
+    baseline_quality: QualityReport,
+    candidate_quality: QualityReport,
+    baseline_spans: list[OCRSpan],
+    candidate_spans: list[OCRSpan],
+    baseline_control_count: int,
+    candidate_control_count: int,
+    min_ocr_gain: float,
+    min_text_retention: float,
+    min_control_retention: float,
+    ocr_engine_enabled: bool,
+) -> EnhancementEvaluation:
+    baseline_ocr = assess_ocr_readiness(baseline_spans)
+    candidate_ocr = assess_ocr_readiness(candidate_spans)
+    ocr_gain = candidate_ocr.score - baseline_ocr.score
+    text_retention = high_confidence_text_retention(
+        baseline_spans, candidate_spans
+    )
+    control_retention = control_count_retention(
+        baseline_control_count, candidate_control_count
+    )
+    rejection_codes: list[str] = []
+    if not ocr_engine_enabled:
+        rejection_codes.append("ocr_engine_disabled")
+    if ocr_gain < min_ocr_gain:
+        rejection_codes.append("insufficient_ocr_gain")
+    if text_retention < min_text_retention:
+        rejection_codes.append("baseline_text_not_preserved")
+    if control_retention < min_control_retention:
+        rejection_codes.append("controls_not_preserved")
+    if candidate_quality.overall < baseline_quality.overall - 0.10:
+        rejection_codes.append("technical_quality_regressed")
+    eligible = not rejection_codes
+    return EnhancementEvaluation(
+        strategy=strategy,
+        candidate_path=candidate_path,
+        technical_before=baseline_quality.overall,
+        technical_after=candidate_quality.overall,
+        ocr_before=baseline_ocr,
+        ocr_after=candidate_ocr,
+        ocr_gain=ocr_gain,
+        text_retention=text_retention,
+        control_retention=control_retention,
+        eligible=eligible,
+        reason="eligible" if eligible else "+".join(rejection_codes),
+    )
+
+
+def _tokens(values: Iterable[str]) -> set[str]:
+    result: set[str] = set()
+    for value in values:
+        result.update(
+            token.casefold()
+            for token in re.findall(r"[^\W_]+", str(value), flags=re.UNICODE)
+            if token
+        )
+    return result

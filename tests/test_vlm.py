@@ -16,13 +16,103 @@ from docuocr.engines.vlm import (
 )
 from docuocr.extraction.blueprint import DocumentBlueprint
 from docuocr.extraction.grounding import GroundedProposal
-from docuocr.models import BBox, EvidenceKind, EvidenceRecord, FieldCandidate, OCRSpan
+from docuocr.models import (
+    BBox,
+    EvidenceKind,
+    EvidenceRecord,
+    FieldCandidate,
+    OCRSpan,
+    QualityReport,
+)
 from docuocr.workflow.nodes import WorkflowNodes
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class VLMClientTests(unittest.TestCase):
+    def test_document_understanding_uses_actual_image_and_bounded_schema(self) -> None:
+        requests: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            requests.append(body)
+            return _response(
+                json.dumps(
+                    {
+                        "detected_document_type": "newborn_screening_form",
+                        "schema_match": "match",
+                        "languages": ["Portuguese"],
+                        "handwriting_present": True,
+                        "handwriting_legibility": "fair",
+                        "regions": [],
+                        "control_groups": [],
+                        "quality_issues": [
+                            {
+                                "kind": "low_contrast",
+                                "severity": "moderate",
+                                "affects": ["handwriting"],
+                                "bbox": {"x1": 10, "y1": 20, "x2": 80, "y2": 60},
+                            }
+                        ],
+                        "recommended_profiles": ["local_contrast"],
+                    }
+                )
+            )
+
+        settings = VLMSettings(enabled=True, request_retries=0)
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "card.png"
+            image.write_bytes(b"actual-image-bytes")
+            result = LocalVLMClient(
+                settings, transport=httpx.MockTransport(handler)
+            ).understand(
+                image_path=image,
+                spans=[],
+                blocks=[],
+                controls=[],
+                quality=QualityReport.model_validate(_quality()),
+                expected_document_type="newborn_screening_form",
+                anchors=["newborn screening"],
+                field_hints={"data.baby.firstName": {"kind": "printed_label_value"}},
+            )
+
+        self.assertIsNotNone(result.understanding)
+        assert result.understanding is not None
+        self.assertEqual(result.understanding.handwriting_legibility, "fair")
+        self.assertEqual(
+            result.understanding.recommended_profiles, ["local_contrast"]
+        )
+        content = requests[0]["messages"][1]["content"]  # type: ignore[index]
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        self.assertEqual(
+            requests[0]["response_format"]["json_schema"]["name"],  # type: ignore[index]
+            "document_understanding",
+        )
+
+    def test_understanding_failure_is_a_warning(self) -> None:
+        settings = VLMSettings(enabled=True, request_retries=0)
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "card.png"
+            image.write_bytes(b"image")
+            result = LocalVLMClient(
+                settings,
+                transport=httpx.MockTransport(
+                    lambda request: _response('{"schema_match":"broken')
+                ),
+            ).understand(
+                image_path=image,
+                spans=[],
+                blocks=[],
+                controls=[],
+                quality=QualityReport.model_validate(_quality()),
+                expected_document_type="newborn_screening_form",
+                anchors=[],
+                field_hints={},
+            )
+
+        self.assertIsNone(result.understanding)
+        self.assertIn("invalid_json_response", result.warnings[0])
+
     def test_truncated_batch_is_split_and_retried(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             body = json.loads(request.content)
